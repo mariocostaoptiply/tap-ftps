@@ -3,7 +3,7 @@ import io
 import chardet
 
 from chardet.universaldetector import UniversalDetector
-from tap_ftps.singer_encodings import compression
+from tap_ftp.singer_encodings import compression
 
 SDC_EXTRA_COLUMN = "_sdc_extra"
 

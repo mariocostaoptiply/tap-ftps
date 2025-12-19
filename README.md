@@ -1,6 +1,6 @@
-# tap-ftps
+# tap-ftp
 
-[Singer](https://www.singer.io/) tap that extracts data from FTPS (FTP over SSL/TLS) files and produces JSON-formatted data following the [Singer spec](https://github.com/singer-io/getting-started/blob/master/docs/SPEC.md).
+[Singer](https://www.singer.io/) tap that extracts data from FTP and FTPS (FTP over SSL/TLS) files and produces JSON-formatted data following the [Singer spec](https://github.com/singer-io/getting-started/blob/master/docs/SPEC.md).
 
 ## Install:
 
@@ -19,14 +19,15 @@ $ pip install .
 
 ## Configuration:
 
-1. Create a `config.json` file with connection details to your FTPS server.
+1. Create a `config.json` file with connection details to your FTP/FTPS server.
 
    ```json
    {
-        "host": "FTPS_HOST_NAME",
+        "host": "FTP_HOST_NAME",
         "port": 21,
         "username": "YOUR_USER",
         "password": "YOUR_PASS",
+        "use_ssl": true,
         "tables": [
             {
                 "table_name": "products",
@@ -49,10 +50,11 @@ $ pip install .
 
    **Configuration Options:**
    
-   - `host` (required): FTPS server hostname or IP address
-   - `port` (optional): FTPS server port (default: 21)
-   - `username` (required): FTPS username
-   - `password` (required): FTPS password (FTPS uses password authentication, not SSH keys)
+   - `host` (required): FTP/FTPS server hostname or IP address
+   - `port` (optional): FTP/FTPS server port (default: 21)
+   - `username` (required): FTP/FTPS username
+   - `password` (required): FTP/FTPS password (FTP/FTPS uses password authentication, not SSH keys)
+   - `use_ssl` (optional): Enable FTPS (FTP over SSL/TLS). Default: false (uses plain FTP)
    - `tables` (required): Array of table configurations
    - `start_date` (required): Initial date for file-level bookmarking (ISO format: YYYY-MM-DD)
    - `timeout` (optional): Timeout in seconds for data transfers (default: 300 seconds / 5 minutes)
@@ -62,7 +64,7 @@ $ pip install .
    **Table Configuration:**
    
    - `table_name` (required): Name of the stream/table
-   - `search_prefix` (required): Directory path on FTPS server to search for files
+   - `search_prefix` (required): Directory path on FTP/FTPS server to search for files
    - `search_pattern` (required): Regex pattern to match filenames (use `^` and `$` for exact matches)
    - `replication_key_column` (optional): Column name for row-level bookmarking (e.g., "updated_at")
    - `delimiter` (optional): CSV delimiter (default: ",")
@@ -81,7 +83,7 @@ The tap can be invoked in discovery mode to find the available tables and
 columns in the database:
 
 ```bash
-$ tap-ftps --config config.json --discover > catalog.json
+$ tap-ftp --config config.json --discover > catalog.json
 ```
 
 A discovered catalog is output, with a JSON-schema description of each table. A
@@ -94,18 +96,18 @@ Edit the `catalog.json` and select the streams to replicate by setting `"selecte
 Run the tap like any other singer compatible tap:
 
 ```bash
-$ tap-ftps --config config.json --catalog catalog.json --state state.json
+$ tap-ftp --config config.json --catalog catalog.json --state state.json
 ```
 
 The tap supports:
 - **File-level bookmarking**: Only processes files modified since the last sync
 - **Row-level bookmarking**: Only processes rows where the replication key value is greater than the last synced value (when `replication_key_column` is configured)
 - **Automatic reconnection**: Retries failed connections with exponential backoff
-- **Secure data channel**: Uses FTPS with TLS/SSL encryption for both control and data connections
+- **FTP and FTPS Support**: Supports both plain FTP and FTPS (FTP over SSL/TLS) based on `use_ssl` configuration
 
 ## Features:
 
-- **FTPS Support**: Secure FTP over SSL/TLS with certificate verification disabled (for self-signed certificates)
+- **FTP/FTPS Support**: Supports both plain FTP and secure FTPS (FTP over SSL/TLS) with certificate verification disabled for self-signed certificates (when `use_ssl=true`)
 - **Incremental Sync**: File-level and row-level bookmarking for efficient incremental updates
 - **CSV Processing**: Automatic CSV parsing with configurable delimiters
 - **Schema Discovery**: Automatic schema inference from CSV files

@@ -6,9 +6,9 @@ import singer
 from singer import metadata, utils
 from terminaltables import AsciiTable
 
-from tap_ftps.discover import discover_streams
-from tap_ftps.stats import STATS
-from tap_ftps.sync import sync_stream
+from tap_ftp.discover import discover_streams
+from tap_ftp.stats import STATS
+from tap_ftp.sync import sync_stream
 
 REQUIRED_CONFIG_KEYS = ["username", "port", "host", "tables", "start_date"]
 REQUIRED_DECRYPT_CONFIG_KEYS = ['SSM_key_name', 'gnupghome', 'passphrase']
@@ -94,10 +94,10 @@ def main():
         # validate decryption configs
         utils.check_config(decrypt_configs, REQUIRED_DECRYPT_CONFIG_KEYS)
     
-    # FTPS requires password (not SSH keys like SFTP)
+    # FTP/FTPS requires password (not SSH keys like SFTP)
     password = args.config.get("password")
     if not password:
-        raise Exception("Config is missing a password. FTPS requires password authentication.")
+        raise Exception("Config is missing a password. FTP/FTPS requires password authentication.")
     
     if args.discover:
         do_discover(args.config)

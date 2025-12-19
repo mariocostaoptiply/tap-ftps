@@ -1,5 +1,5 @@
 import re
-from tap_ftps.aws_ssm import AWS_SSM
+from tap_ftp.aws_ssm import AWS_SSM
 from . import csv_handler
 
 SDC_SOURCE_FILE_COLUMN = "_sdc_source_file"
@@ -10,6 +10,29 @@ def get_schema_for_table(conn, table_spec, config):
     search_subdir = config.get("search_subdirectories", True)
     files = conn.get_files(table_spec['search_prefix'], table_spec['search_pattern'], search_subdirectories=search_subdir)
 
+    if not files:
+        return {}
+
+    samples = sample_files(conn, table_spec, files, config)
+
+    data_schema = {
+        **generate_schema(samples, table_spec),
+        SDC_SOURCE_FILE_COLUMN: {'type': 'string'},
+        SDC_SOURCE_LINENO_COLUMN: {'type': 'integer'},
+        csv_handler.SDC_EXTRA_COLUMN: {'type': 'array', 'items': {'type': 'string'}},
+    }
+
+    return {
+        'type': 'object',
+        'properties': data_schema,
+    }
+
+
+def get_schema_for_table_with_files(conn, table_spec, files, config):
+    """
+    Get schema for a table using pre-filtered files.
+    This is used by discover to avoid redundant directory listings.
+    """
     if not files:
         return {}
 

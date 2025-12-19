@@ -1,4 +1,4 @@
 .DEFAULT_GOAL := test
 
 test:
-	pylint tap_ftps -d missing-docstring,fixme,duplicate-code,line-too-long
+	pylint tap_ftp -d missing-docstring,fixme,duplicate-code,line-too-long

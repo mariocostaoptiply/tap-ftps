@@ -1,9 +1,9 @@
 import singer
 from singer import Transformer, metadata, utils
-from tap_ftps import client, stats
-from tap_ftps.singer_write import write_record
-from tap_ftps.aws_ssm import AWS_SSM
-from tap_ftps.singer_encodings import csv_handler
+from tap_ftp import client, stats
+from tap_ftp.singer_write import write_record
+from tap_ftp.aws_ssm import AWS_SSM
+from tap_ftp.singer_encodings import csv_handler
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -12,8 +12,8 @@ import backoff
 LOGGER = singer.get_logger()
 
 
-def sync_ftp(ftps_file, stream, table_spec, config, state, table_name):
-    records_streamed, max_row_timestamp, replication_key_column_used = sync_file(ftps_file, stream, table_spec, config, state, table_name)
+def sync_ftp(ftp_file, stream, table_spec, config, state, table_name):
+    records_streamed, max_row_timestamp, replication_key_column_used = sync_file(ftp_file, stream, table_spec, config, state, table_name)
     # Return the state update instead of writing it directly
     # Auto-enable replication key if replication_key_column is provided
     replication_key_column = table_spec.get('replication_key_column', '').strip() if table_spec.get('replication_key_column') else None
@@ -47,7 +47,7 @@ def sync_ftp(ftps_file, stream, table_spec, config, state, table_name):
     state_update = {
         'table_name': table_name,
         'bookmark_key': 'modified_since',
-        'modified_since': ftps_file['last_modified'].isoformat(),
+        'modified_since': ftp_file['last_modified'].isoformat(),
         'replication_key_column': replication_key_column_used,  # Store the column name used for replication key
         'replication_key_value': max_row_timestamp.isoformat() if max_row_timestamp else None
     }
@@ -65,7 +65,7 @@ def sync_stream(config, state, stream):
     LOGGER.info('Syncing table "%s".', table_visible_name)
     LOGGER.info('Getting files modified since %s.', modified_since)
 
-    ftps_client = client.connection(config)
+    ftp_client = client.connection(config)
     table_spec = [table_config for table_config in config["tables"] if table_config["table_name"] == table_original_name]
     if len(table_spec) == 0:
         LOGGER.info("No table configuration found for '%s', skipping stream", table_visible_name)
@@ -75,13 +75,13 @@ def sync_stream(config, state, stream):
         return 0
     table_spec = table_spec[0]
 
-    files = ftps_client.get_files(
+    files = ftp_client.get_files(
         table_spec["search_prefix"],
         table_spec["search_pattern"],
         modified_since,
         search_subdir
     )
-    ftps_client.close()
+    ftp_client.close()
 
     LOGGER.info('Found %s files to be synced.', len(files))
 
@@ -93,8 +93,8 @@ def sync_stream(config, state, stream):
     state_updates = []
     
     with ThreadPoolExecutor(max_workers=8) as executor:
-        future_ftps = {executor.submit(sync_ftp, ftps_file, stream, table_spec, config, state, table_visible_name): ftps_file for ftps_file in files}
-        for future in as_completed(future_ftps):
+        future_ftp = {executor.submit(sync_ftp, ftp_file, stream, table_spec, config, state, table_visible_name): ftp_file for ftp_file in files}
+        for future in as_completed(future_ftp):
             result = future.result()
             records_streamed += result[0]
             state_updates.append(result[1])
@@ -142,21 +142,21 @@ def sync_stream(config, state, stream):
         max_tries=3,
         jitter=backoff.random_jitter,
         factor=2)
-def sync_file(ftps_file_spec, stream, table_spec, config, state, table_name):
-    LOGGER.info('Syncing file "%s".', ftps_file_spec["filepath"])
-    ftps_client = client.connection(config)
+def sync_file(ftp_file_spec, stream, table_spec, config, state, table_name):
+    LOGGER.info('Syncing file "%s".', ftp_file_spec["filepath"])
+    ftp_client = client.connection(config)
     decryption_configs = config.get('decryption_configs')
     if decryption_configs:
         decryption_configs['key'] = AWS_SSM.get_decryption_key(decryption_configs.get('SSM_key_name'))
     # Attempt to re-read from the file incase of IO or OS error
-    with ftps_client.get_file_handle(ftps_file_spec, decryption_configs) as file_handle:
+    with ftp_client.get_file_handle(ftp_file_spec, decryption_configs) as file_handle:
         if decryption_configs:
-            ftps_file_spec['filepath'] = file_handle.name
+            ftp_file_spec['filepath'] = file_handle.name
 
         # Add file_name to opts and flag infer_compression to support gzipped files
         opts = {'key_properties': table_spec.get('key_properties', []),
                 'delimiter': table_spec.get('delimiter', ','),
-                'file_name': ftps_file_spec['filepath'],
+                'file_name': ftp_file_spec['filepath'],
                 'encoding': table_spec.get('encoding', config.get('encoding'))}
 
         readers = csv_handler.get_row_iterators(file_handle, options=opts, infer_compression=True)
@@ -169,7 +169,7 @@ def sync_file(ftps_file_spec, stream, table_spec, config, state, table_name):
         enable_row_level = table_spec.get('enable_replication_key', False) or bool(replication_key_column)
         # CSV detection: check if delimiter is set, or if file pattern suggests CSV
         is_csv = table_spec.get('delimiter') is not None or \
-                 ftps_file_spec['filepath'].lower().endswith('.csv') or \
+                 ftp_file_spec['filepath'].lower().endswith('.csv') or \
                  table_spec.get('search_pattern', '').lower().endswith('.csv')
         
         # Prepare for replication key filtering if needed
@@ -268,7 +268,7 @@ def sync_file(ftps_file_spec, stream, table_spec, config, state, table_name):
                         row[csv_handler.SDC_EXTRA_COLUMN] = []
                     
                     custom_columns = {
-                        '_sdc_source_file': ftps_file_spec["filepath"],
+                        '_sdc_source_file': ftp_file_spec["filepath"],
 
                         # index zero, +1 for header row
                         '_sdc_source_lineno': records_synced + 2
@@ -283,17 +283,17 @@ def sync_file(ftps_file_spec, stream, table_spec, config, state, table_name):
                         LOGGER.info(f'Synced Record Count: {records_synced}')
             LOGGER.info(f'Sync Complete - Records Synced: {records_synced}')
 
-    stats.add_file_data(table_spec, ftps_file_spec['filepath'], ftps_file_spec['last_modified'], records_synced)
+    stats.add_file_data(table_spec, ftp_file_spec['filepath'], ftp_file_spec['last_modified'], records_synced)
 
     if config.get('delete_after_sync'):
         # Use FTP delete command (DELE) to remove file
         try:
-            ftps_client.ftp.delete(ftps_file_spec["filepath"])
-            LOGGER.info(f"Deleting remote file: {ftps_file_spec['filepath']}")
+            ftp_client.ftp.delete(ftp_file_spec["filepath"])
+            LOGGER.info(f"Deleting remote file: {ftp_file_spec['filepath']}")
         except Exception as e:
-            LOGGER.warning(f"Failed to delete remote file {ftps_file_spec['filepath']}: {e}")
-    ftps_client.close()
-    del ftps_client
+            LOGGER.warning(f"Failed to delete remote file {ftp_file_spec['filepath']}: {e}")
+    ftp_client.close()
+    del ftp_client
 
     if enable_row_level and rows_filtered > 0:
         LOGGER.info(

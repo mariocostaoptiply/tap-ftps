@@ -6,17 +6,17 @@ with open('requirements.txt', 'r') as fh:
     requirements = fh.read().splitlines()
 
 setup(
-    name="tap-ftps",
+    name="tap-ftp",
     version="0.0.2",
     description="Singer.io tap for extracting data",
     author="Optiply",
     url="http://singer.io",
     classifiers=["Programming Language :: Python :: 3 :: Only"],
-    py_modules=["tap_ftps"],
+    py_modules=["tap_ftp"],
     install_requires=requirements,
     entry_points="""
     [console_scripts]
-    tap-ftps=tap_ftps.tap:main
+    tap-ftp=tap_ftp.tap:main
     """,
-    packages=["tap_ftps", "tap_ftps.singer_encodings"]
+    packages=["tap_ftp", "tap_ftp.singer_encodings"]
 )

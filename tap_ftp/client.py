@@ -5,13 +5,13 @@ import tempfile
 import time
 from datetime import datetime
 import backoff
-from ftplib import FTP_TLS, all_errors
+from ftplib import FTP, FTP_TLS, all_errors
 import ssl
 import pytz
 import singer
 from ftplib import error_perm, error_temp, error_proto, error_reply
 
-from tap_ftps import decrypt
+from tap_ftp import decrypt
 
 LOGGER = singer.get_logger()
 
@@ -19,12 +19,15 @@ logging.getLogger("ftplib").setLevel(logging.CRITICAL)
 
 def handle_backoff(details):
     LOGGER.warn(
-        "FTPS Connection closed unexpectedly. Waiting {wait} seconds and retrying...".format(**details)
+        "FTP Connection closed unexpectedly. Waiting {wait} seconds and retrying...".format(**details)
     )
 
 
-class FTPSConnection():
-    def __init__(self, host, username, password=None, private_key_file=None, port=None, ssl_context=None, timeout=None, connect_timeout=None):
+# Global cache for MLSD support per server (host:port)
+_mlsd_support_cache = {}
+
+class FTPConnection():
+    def __init__(self, host, username, password=None, private_key_file=None, port=None, use_ssl=False, ssl_context=None, timeout=None, connect_timeout=None):
         self.host = host
         self.username = username
         self.password = password
@@ -34,10 +37,13 @@ class FTPSConnection():
         self.connect_timeout = connect_timeout or 30  # Default connection timeout: 30 seconds
         self.__ftp = None
         self.current_dir = None  # Remember current working directory for reconnection
-        self.ssl_context = ssl_context or self._create_ssl_context()
+        self.use_ssl = use_ssl
+        self.ssl_context = ssl_context or (self._create_ssl_context() if use_ssl else None)
+        # Use global cache keyed by host:port to persist across connection instances
+        self._cache_key = f"{host}:{self.port}"
 
     def _create_ssl_context(self):
-        """Create SSL context with certificate verification disabled for FTPS client"""
+        """Create SSL context with certificate verification disabled for FTPS client (when use_ssl=True)"""
         # Use SERVER_AUTH for client connections (to authenticate the server)
         # CLIENT_AUTH is for servers authenticating clients
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -48,7 +54,7 @@ class FTPSConnection():
         return ctx
 
     # If connection is snapped during connect flow, retry up to a
-    # minute for FTPS connection to succeed. 2^6 + 2^5 + ...
+    # minute for FTP/FTPS connection to succeed. 2^6 + 2^5 + ...
     @backoff.on_exception(
         backoff.expo,
         (EOFError, ConnectionResetError),
@@ -57,16 +63,24 @@ class FTPSConnection():
         jitter=None,
         factor=2)
     def __connect(self):
+        # Note: MLSD support cache is global and keyed by host:port, so it persists across reconnections
         for i in range(self.retries+1):
             try:
-                LOGGER.info(f'Creating new connection to FTPS at {self.host}:{self.port}...')
+                protocol = "FTPS" if self.use_ssl else "FTP"
+                LOGGER.info(f'Creating new connection to {protocol} at {self.host}:{self.port}...')
                 
-                # Create FTP_TLS connection with SSL context
-                # FTP_TLS doesn't accept port in __init__, so we create instance then connect
-                self.__ftp = FTP_TLS(context=self.ssl_context)
+                # Create FTP or FTP_TLS connection based on use_ssl flag
+                if self.use_ssl:
+                    # FTP_TLS doesn't accept port in __init__, so we create instance then connect
+                    self.__ftp = FTP_TLS(context=self.ssl_context)
+                    LOGGER.debug(f'FTP_TLS instance created with connect_timeout={self.connect_timeout}s, attempting to connect...')
+                else:
+                    # Plain FTP connection
+                    self.__ftp = FTP()
+                    LOGGER.debug(f'FTP instance created with connect_timeout={self.connect_timeout}s, attempting to connect...')
+                
                 # Set connection timeout (shorter for initial connection)
                 self.__ftp.timeout = self.connect_timeout
-                LOGGER.debug(f'FTP_TLS instance created with connect_timeout={self.connect_timeout}s, attempting to connect...')
                 self.__ftp.connect(host=self.host, port=self.port)
                 # After successful connection, set longer timeout for data transfers
                 self.__ftp.timeout = self.timeout
@@ -74,10 +88,15 @@ class FTPSConnection():
                 LOGGER.debug('Connection established, attempting login...')
                 LOGGER.debug(f'Login attempt - username: {repr(self.username)}, password length: {len(self.password) if self.password else 0}')
                 self.__ftp.login(user=self.username, passwd=self.password)
-                LOGGER.debug('Login successful, enabling secure data channel...')
-                # Enable secure data channel (PBSZ and PROT P)
-                self.__ftp.prot_p()
-                LOGGER.debug('Secure data channel enabled')
+                
+                # Enable secure data channel only for FTPS (when use_ssl=True)
+                if self.use_ssl:
+                    LOGGER.debug('Login successful, enabling secure data channel...')
+                    # Enable secure data channel (PBSZ and PROT P)
+                    self.__ftp.prot_p()
+                    LOGGER.debug('Secure data channel enabled')
+                else:
+                    LOGGER.debug('Login successful')
                 
                 # Restore working directory if we had one
                 if self.current_dir:
@@ -188,32 +207,92 @@ class FTPSConnection():
         if prefix is None or prefix == '':
             prefix = '.'
 
-        try:
-            # Use MLSD for detailed file information (similar to listdir_attr in SFTP)
-            # MLSD returns list of (name, facts_dict) tuples
-            result = list(self.ftp.mlsd(prefix))
-        except (error_perm, error_temp, error_proto, error_reply) as e:
-            # If MLSD is not supported, fall back to LIST command
-            LOGGER.debug(f"MLSD not supported, falling back to LIST for {prefix}")
+        # Check global cache to see if we already know MLSD is not supported for this server
+        # If not supported, skip MLSD and go directly to LIST for better performance
+        if _mlsd_support_cache.get(self._cache_key) is False:
+            # MLSD not supported, use LIST directly
+            result = self._list_with_details(prefix)
+        else:
+            # Try MLSD first (or if we haven't tested yet)
+            result = None
+            mlsd_supported = True
+            
             try:
-                result = self._list_with_details(prefix)
-            except Exception as list_error:
-                # Re-raise the original MLSD error, not the LIST error
-                if isinstance(e, error_perm):
-                    raise Exception(f"Permission denied listing directory {prefix}: {e}") from e
-                elif isinstance(e, error_temp):
-                    raise Exception(f"Temporary error listing directory {prefix}: {e}") from e
-                elif isinstance(e, error_proto):
-                    raise Exception(f"Protocol error listing directory {prefix}: {e}") from e
-                else:
-                    raise Exception(f"Error listing directory {prefix}: {e}") from e
-        except (OSError, EOFError, ConnectionResetError) as e:
-            LOGGER.info("Socket closed. Retrying")
-            self.__connect()
-            try:
+                # Use MLSD for detailed file information (similar to listdir_attr in SFTP)
+                # MLSD returns list of (name, facts_dict) tuples
                 result = list(self.ftp.mlsd(prefix))
-            except:
-                result = self._list_with_details(prefix)
+                # If successful and we haven't cached it yet, mark as supported
+                if _mlsd_support_cache.get(self._cache_key) is None:
+                    _mlsd_support_cache[self._cache_key] = True
+            except (error_perm, error_temp, error_proto, error_reply) as e:
+                # Check if it's a "file does not exist" error (550, 450) - directory doesn't exist
+                error_msg = str(e).lower()
+                error_code = str(e).split()[0] if str(e).split() else ''
+                if '550' in error_code or '450' in error_code or 'file does not exist' in error_msg or 'could not list' in error_msg:
+                    # Directory doesn't exist - return empty list
+                    LOGGER.warning(f"Directory '{prefix}' does not exist, returning empty file list")
+                    return []
+                # Check if it's a "500 Unknown command" error (MLSD not supported)
+                elif '500' in error_msg or 'unknown command' in error_msg or 'not implemented' in error_msg:
+                    # Cache that MLSD is not supported for this server
+                    if _mlsd_support_cache.get(self._cache_key) is None:
+                        LOGGER.info(f"MLSD command not supported by server {self._cache_key}, will use LIST for all subsequent operations")
+                        _mlsd_support_cache[self._cache_key] = False
+                    # Use LIST directly
+                    result = self._list_with_details(prefix)
+                else:
+                    # Other permission/protocol errors - try reconnecting first
+                    LOGGER.warning(f"MLSD failed with error: {e}. Attempting to reconnect and retry...")
+                    try:
+                        self.__connect()
+                        result = list(self.ftp.mlsd(prefix))
+                        if _mlsd_support_cache.get(self._cache_key) is None:
+                            _mlsd_support_cache[self._cache_key] = True
+                    except Exception as retry_error:
+                        # Check if retry also fails with "file does not exist"
+                        retry_error_msg = str(retry_error).lower()
+                        retry_error_code = str(retry_error).split()[0] if str(retry_error).split() else ''
+                        if '550' in retry_error_code or '450' in retry_error_code or 'file does not exist' in retry_error_msg or 'could not list' in retry_error_msg:
+                            LOGGER.warning(f"Directory '{prefix}' does not exist, returning empty file list")
+                            return []
+                        # If retry also fails with unknown command, cache it
+                        elif '500' in retry_error_msg or 'unknown command' in retry_error_msg or 'not implemented' in retry_error_msg:
+                            if _mlsd_support_cache.get(self._cache_key) is None:
+                                LOGGER.info(f"MLSD command not supported by server {self._cache_key}, will use LIST for all subsequent operations")
+                                _mlsd_support_cache[self._cache_key] = False
+                        result = self._list_with_details(prefix)
+            except (OSError, EOFError, ConnectionResetError, TimeoutError) as e:
+                LOGGER.info(f"Socket/timeout error ({type(e).__name__}). Retrying")
+                self.__connect()
+                try:
+                    result = list(self.ftp.mlsd(prefix))
+                    if _mlsd_support_cache.get(self._cache_key) is None:
+                        _mlsd_support_cache[self._cache_key] = True
+                except (error_perm, error_temp, error_proto, error_reply) as mlsd_error:
+                    # Check if it's "file does not exist" error
+                    error_msg = str(mlsd_error).lower()
+                    error_code = str(mlsd_error).split()[0] if str(mlsd_error).split() else ''
+                    if '550' in error_code or '450' in error_code or 'file does not exist' in error_msg or 'could not list' in error_msg:
+                        LOGGER.warning(f"Directory '{prefix}' does not exist, returning empty file list")
+                        return []
+                    # Check if it's "unknown command" error
+                    elif '500' in error_msg or 'unknown command' in error_msg or 'not implemented' in error_msg:
+                        if _mlsd_support_cache.get(self._cache_key) is None:
+                            LOGGER.info(f"MLSD command not supported by server {self._cache_key}, will use LIST for all subsequent operations")
+                            _mlsd_support_cache[self._cache_key] = False
+                    result = self._list_with_details(prefix)
+                except (OSError, EOFError, ConnectionResetError, TimeoutError) as conn_error:
+                    # Connection/timeout error persists, try LIST as fallback
+                    LOGGER.warning(f"Connection/timeout error persisted, falling back to LIST for {prefix}")
+                    result = self._list_with_details(prefix)
+                except Exception:
+                    # Any other error, try LIST
+                    result = self._list_with_details(prefix)
+
+        # Ensure result is not None
+        if result is None:
+            LOGGER.error(f"Failed to get file list for {prefix} using both MLSD and LIST")
+            raise Exception(f"Unable to list directory {prefix}: Both MLSD and LIST commands failed")
 
         for name, facts in result:
             # Skip . and .. entries
@@ -269,13 +348,48 @@ class FTPSConnection():
     def _list_with_details(self, path):
         """Fallback method to get file details using LIST command when MLSD is not available"""
         lines = []
-        self.ftp.retrlines(f'LIST {path}', lines.append)
+        try:
+            self.ftp.retrlines(f'LIST {path}', lines.append)
+        except (error_perm, error_temp) as e:
+            # Check if it's "file does not exist" error (550, 450)
+            error_msg = str(e).lower()
+            error_code = str(e).split()[0] if str(e).split() else ''
+            if '550' in error_code or '450' in error_code or 'file does not exist' in error_msg or 'could not list' in error_msg:
+                LOGGER.warning(f"Directory '{path}' does not exist, returning empty file list")
+                return []
+            # Re-raise other permission/temp errors
+            raise
+        except (OSError, EOFError, ConnectionResetError, TimeoutError) as e:
+            LOGGER.warning(f"Connection/timeout error during LIST command: {type(e).__name__}, reconnecting...")
+            self.__connect()
+            try:
+                self.ftp.retrlines(f'LIST {path}', lines.append)
+            except (error_perm, error_temp) as e2:
+                # Check if it's "file does not exist" error after reconnect
+                error_msg = str(e2).lower()
+                error_code = str(e2).split()[0] if str(e2).split() else ''
+                if '550' in error_code or '450' in error_code or 'file does not exist' in error_msg or 'could not list' in error_msg:
+                    LOGGER.warning(f"Directory '{path}' does not exist, returning empty file list")
+                    return []
+                # Re-raise other errors
+                raise
+            except (OSError, EOFError, ConnectionResetError, TimeoutError) as e2:
+                # If timeout/connection error persists after reconnect, raise with context
+                LOGGER.error(f"Connection/timeout error persisted after reconnect during LIST '{path}': {type(e2).__name__}")
+                raise Exception(f"Failed to list directory '{path}' after reconnect: {e2}") from e2
         
         result = []
         for line in lines:
+            if not line.strip():
+                continue
+                
             # Parse LIST output (format varies by server, but typically: permissions links owner group size date time name)
+            # Unix format: -rw-r--r-- 1 owner group size date time name
+            # Windows format: MM-DD-YY HH:MMAM/PM size name
             parts = line.split(None, 8)
+            
             if len(parts) >= 9:
+                # Unix-style format
                 name = parts[8]
                 # Try to determine if it's a directory (starts with 'd')
                 is_dir = parts[0].startswith('d') if parts[0] else False
@@ -284,12 +398,40 @@ class FTPSConnection():
                     size = int(parts[4]) if len(parts) > 4 else 0
                 except (ValueError, IndexError):
                     size = 0
-                
-                facts = {
-                    'type': 'dir' if is_dir else 'file',
-                    'size': str(size)
-                }
-                result.append((name, facts))
+            elif len(parts) >= 3:
+                # Windows-style format or minimal format
+                # Try to extract name (usually last part) and size
+                name = parts[-1] if parts else ""
+                is_dir = False  # Can't determine from Windows format easily
+                try:
+                    # Size might be in different positions
+                    for part in parts:
+                        try:
+                            size = int(part)
+                            break
+                        except ValueError:
+                            size = 0
+                except (ValueError, IndexError):
+                    size = 0
+            else:
+                # Skip lines that don't match expected format
+                LOGGER.debug(f"Skipping unparseable LIST line: {line}")
+                continue
+            
+            # Skip . and .. entries
+            if name in ['.', '..']:
+                continue
+            
+            facts = {
+                'type': 'dir' if is_dir else 'file',
+                'size': str(size)
+                # Note: modify date not available from LIST, will use MDTM later
+            }
+            result.append((name, facts))
+        
+        if not result:
+            LOGGER.warning(f"LIST command returned no parseable entries for {path}")
+        
         return result
 
     def get_files(self, prefix, search_pattern, modified_since=None, search_subdirectories=True):
@@ -300,14 +442,14 @@ class FTPSConnection():
             sample_filenames = [os.path.basename(f['filepath']) for f in files[:5]]
             LOGGER.debug(f"Sample filenames: {sample_filenames}")
         else:
-            LOGGER.warning('Found no files on specified FTPS server at "%s"', prefix)
+            LOGGER.warning('Found no files on specified FTP server at "%s"', prefix)
 
         matching_files = self.get_files_matching_pattern(files, search_pattern)
 
         if matching_files:
             LOGGER.info('Found %s files in "%s" matching "%s"', len(matching_files), prefix, search_pattern)
         else:
-            LOGGER.warning('Found no files on specified FTPS server at "%s" matching "%s"', prefix, search_pattern)
+            LOGGER.warning('Found no files on specified FTP server at "%s" matching "%s"', prefix, search_pattern)
 
         for f in matching_files:
             LOGGER.info("Found file: %s", f['filepath'])
@@ -320,19 +462,19 @@ class FTPSConnection():
     def get_file_handle(self, f, decryption_configs=None):
         """ Takes a file dict {"filepath": "...", "last_modified": "..."} and returns a handle to the file. """
         with tempfile.TemporaryDirectory() as tmpdirname:
-            ftps_file_path = f["filepath"]
-            local_path = f'{tmpdirname}/{os.path.basename(ftps_file_path)}'
+            ftp_file_path = f["filepath"]
+            local_path = f'{tmpdirname}/{os.path.basename(ftp_file_path)}'
             if decryption_configs:
-                LOGGER.info(f'Decrypting file: {ftps_file_path}')
-                # Download FTPS file to local, then decrypt
+                LOGGER.info(f'Decrypting file: {ftp_file_path}')
+                # Download FTP file to local, then decrypt
                 try:
                     with open(local_path, 'wb') as local_file:
-                        self.ftp.retrbinary(f'RETR {ftps_file_path}', local_file.write)
+                        self.ftp.retrbinary(f'RETR {ftp_file_path}', local_file.write)
                 except (OSError, EOFError, ConnectionResetError, TimeoutError) as e:
                     LOGGER.warning(f"Connection error during download, retrying: {e}")
                     self.__connect()
                     with open(local_path, 'wb') as local_file:
-                        self.ftp.retrbinary(f'RETR {ftps_file_path}', local_file.write)
+                        self.ftp.retrbinary(f'RETR {ftp_file_path}', local_file.write)
                 
                 decrypted_path = decrypt.gpg_decrypt(
                     local_path,
@@ -345,16 +487,16 @@ class FTPSConnection():
                 try:
                     return open(decrypted_path, 'rb')
                 except FileNotFoundError:
-                    raise Exception(f'Decryption of file failed: {ftps_file_path}')
+                    raise Exception(f'Decryption of file failed: {ftp_file_path}')
             else:
                 try:
                     with open(local_path, 'wb') as local_file:
-                        self.ftp.retrbinary(f'RETR {ftps_file_path}', local_file.write)
+                        self.ftp.retrbinary(f'RETR {ftp_file_path}', local_file.write)
                 except (OSError, EOFError, ConnectionResetError, TimeoutError) as e:
                     LOGGER.warning(f"Connection error during download, retrying: {e}")
                     self.__connect()
                     with open(local_path, 'wb') as local_file:
-                        self.ftp.retrbinary(f'RETR {ftps_file_path}', local_file.write)
+                        self.ftp.retrbinary(f'RETR {ftp_file_path}', local_file.write)
                 return open(local_path, 'rb')
 
     def get_files_matching_pattern(self, files, pattern):
@@ -387,9 +529,10 @@ class FTPSConnection():
 
 
 def connection(config):
-    return FTPSConnection(config['host'],
+    return FTPConnection(config['host'],
                           config['username'],
                           password=config.get('password'),
                           port=config.get('port'),
+                          use_ssl=config.get('use_ssl', False),
                           timeout=config.get('timeout'),
                           connect_timeout=config.get('connect_timeout'))
