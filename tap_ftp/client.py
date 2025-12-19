@@ -566,10 +566,12 @@ class FTPConnection():
         matcher = re.compile(pattern)
         LOGGER.info(f"Searching for files for matching pattern: {pattern}")
         
-        # Debug: Log sample filenames to help troubleshoot
+        # Always log all filenames found to help troubleshoot (especially in cron jobs)
         if files:
-            sample_filenames = [os.path.basename(f["filepath"]) for f in files[:5]]
-            LOGGER.debug(f"Sample filenames found: {sample_filenames}")
+            all_filenames = [os.path.basename(f["filepath"]) for f in files]
+            LOGGER.info(f"Found {len(files)} file(s) to check. Filenames: {all_filenames}")
+        else:
+            LOGGER.warning(f"No files found to match against pattern '{pattern}'")
         
         # Match against filename only (basename), not full path
         # This is more intuitive and matches user expectations
@@ -578,12 +580,13 @@ class FTPConnection():
             filename = os.path.basename(f["filepath"])
             if matcher.search(filename):
                 matching.append(f)
-                LOGGER.debug(f"Match found: {filename} (full path: {f['filepath']})")
+                LOGGER.info(f"Match found: {filename} (full path: {f['filepath']})")
         
         if not matching and files:
             LOGGER.warning(
                 f"No files matched pattern '{pattern}'. "
-                f"Pattern is matched against filename only (not full path)."
+                f"Pattern is matched against filename only (not full path). "
+                f"Available filenames were: {[os.path.basename(f['filepath']) for f in files]}"
             )
         
         return matching
