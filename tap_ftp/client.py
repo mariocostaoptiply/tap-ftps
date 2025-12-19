@@ -41,6 +41,7 @@ class FTPConnection():
         self.ssl_context = ssl_context or (self._create_ssl_context() if use_ssl else None)
         # Use global cache keyed by host:port to persist across connection instances
         self._cache_key = f"{host}:{self.port}"
+        self._connection_failed_permanently = False  # Flag to prevent infinite retry loops
 
     def _create_ssl_context(self):
         """Create SSL context with certificate verification disabled for FTPS client (when use_ssl=True)"""
@@ -106,6 +107,7 @@ class FTPConnection():
                         LOGGER.warning(f"Could not restore directory {self.current_dir}, using current directory")
                 
                 LOGGER.info('Connection successful')
+                self._connection_failed_permanently = False  # Reset flag on successful connection
                 break
             except (EOFError, ConnectionResetError, TimeoutError) + all_errors as ex:
                 if self.__ftp:
@@ -122,6 +124,12 @@ class FTPConnection():
                 time.sleep(5*i)
                 LOGGER.info("Retrying to establish a connection...")
                 if i >= (self.retries):
+                    self._connection_failed_permanently = True
+                    # Raise specific error for timeout failures
+                    if isinstance(ex, TimeoutError):
+                        raise Exception(f"FTP/FTPS connection failed permanently due to timeout after {self.retries+1} attempts. "
+                                      f"Unable to connect to {self.host}:{self.port} within {self.connect_timeout}s timeout. "
+                                      f"Last error: {error_type}: {error_msg}") from ex
                     raise ex
             except Exception as ex:
                 # Catch any other unexpected exceptions
@@ -141,11 +149,19 @@ class FTPConnection():
                 time.sleep(5*i)
                 LOGGER.info("Retrying to establish a connection...")
                 if i >= (self.retries):
+                    self._connection_failed_permanently = True
+                    # Raise specific error for timeout failures
+                    if isinstance(ex, TimeoutError):
+                        raise Exception(f"FTP/FTPS connection failed permanently due to timeout after {self.retries+1} attempts. "
+                                      f"Unable to connect to {self.host}:{self.port} within {self.connect_timeout}s timeout. "
+                                      f"Last error: {error_type}: {error_msg}") from ex
                     raise ex
 
     @property
     def ftp(self):
         if self.__ftp is None:
+            if self._connection_failed_permanently:
+                raise Exception(f"FTP/FTPS connection failed permanently after all retry attempts. Cannot reconnect to {self.host}:{self.port}.")
             self.__connect()
         return self.__ftp
 
@@ -244,6 +260,12 @@ class FTPConnection():
                     # Other permission/protocol errors - try reconnecting first
                     LOGGER.warning(f"MLSD failed with error: {e}. Attempting to reconnect and retry...")
                     try:
+                        if self._connection_failed_permanently:
+                            if isinstance(e, TimeoutError):
+                                raise Exception(f"FTP/FTPS MLSD operation failed permanently due to timeout. "
+                                              f"Unable to list directory '{prefix}' on {self.host}:{self.port} after all retry attempts. "
+                                              f"Operation timeout: {self.timeout}s") from e
+                            raise Exception(f"FTP/FTPS connection failed permanently after all retry attempts. Cannot reconnect to {self.host}:{self.port}.") from e
                         self.__connect()
                         result = list(self.ftp.mlsd(prefix))
                         if _mlsd_support_cache.get(self._cache_key) is None:
@@ -263,6 +285,12 @@ class FTPConnection():
                         result = self._list_with_details(prefix)
             except (OSError, EOFError, ConnectionResetError, TimeoutError) as e:
                 LOGGER.info(f"Socket/timeout error ({type(e).__name__}). Retrying")
+                if self._connection_failed_permanently:
+                    if isinstance(e, TimeoutError):
+                        raise Exception(f"FTP/FTPS operation failed permanently due to timeout. "
+                                      f"Connection to {self.host}:{self.port} failed after all retry attempts. "
+                                      f"Operation timeout: {self.timeout}s") from e
+                    raise Exception(f"FTP/FTPS connection failed permanently after all retry attempts. Cannot reconnect to {self.host}:{self.port}.") from e
                 self.__connect()
                 try:
                     result = list(self.ftp.mlsd(prefix))
@@ -361,6 +389,12 @@ class FTPConnection():
             raise
         except (OSError, EOFError, ConnectionResetError, TimeoutError) as e:
             LOGGER.warning(f"Connection/timeout error during LIST command: {type(e).__name__}, reconnecting...")
+            if self._connection_failed_permanently:
+                if isinstance(e, TimeoutError):
+                    raise Exception(f"FTP/FTPS LIST operation failed permanently due to timeout. "
+                                  f"Unable to list directory '{path}' on {self.host}:{self.port} after all retry attempts. "
+                                  f"Operation timeout: {self.timeout}s") from e
+                raise Exception(f"FTP/FTPS connection failed permanently after all retry attempts. Cannot reconnect to {self.host}:{self.port}.") from e
             self.__connect()
             try:
                 self.ftp.retrlines(f'LIST {path}', lines.append)
@@ -472,6 +506,12 @@ class FTPConnection():
                         self.ftp.retrbinary(f'RETR {ftp_file_path}', local_file.write)
                 except (OSError, EOFError, ConnectionResetError, TimeoutError) as e:
                     LOGGER.warning(f"Connection error during download, retrying: {e}")
+                    if self._connection_failed_permanently:
+                        if isinstance(e, TimeoutError):
+                            raise Exception(f"FTP/FTPS download failed permanently due to timeout. "
+                                          f"Unable to download file '{ftp_file_path}' from {self.host}:{self.port} after all retry attempts. "
+                                          f"Operation timeout: {self.timeout}s") from e
+                        raise Exception(f"FTP/FTPS connection failed permanently after all retry attempts. Cannot reconnect to {self.host}:{self.port}.") from e
                     self.__connect()
                     with open(local_path, 'wb') as local_file:
                         self.ftp.retrbinary(f'RETR {ftp_file_path}', local_file.write)
@@ -494,6 +534,12 @@ class FTPConnection():
                         self.ftp.retrbinary(f'RETR {ftp_file_path}', local_file.write)
                 except (OSError, EOFError, ConnectionResetError, TimeoutError) as e:
                     LOGGER.warning(f"Connection error during download, retrying: {e}")
+                    if self._connection_failed_permanently:
+                        if isinstance(e, TimeoutError):
+                            raise Exception(f"FTP/FTPS download failed permanently due to timeout. "
+                                          f"Unable to download file '{ftp_file_path}' from {self.host}:{self.port} after all retry attempts. "
+                                          f"Operation timeout: {self.timeout}s") from e
+                        raise Exception(f"FTP/FTPS connection failed permanently after all retry attempts. Cannot reconnect to {self.host}:{self.port}.") from e
                     self.__connect()
                     with open(local_path, 'wb') as local_file:
                         self.ftp.retrbinary(f'RETR {ftp_file_path}', local_file.write)
