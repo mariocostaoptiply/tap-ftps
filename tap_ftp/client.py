@@ -42,6 +42,7 @@ class FTPConnection():
         # Use global cache keyed by host:port to persist across connection instances
         self._cache_key = f"{host}:{self.port}"
         self._connection_failed_permanently = False  # Flag to prevent infinite retry loops
+        self._total_connection_attempts = 0  # Track total connection attempts across all __connect() calls
 
     def _create_ssl_context(self):
         """Create SSL context with certificate verification disabled for FTPS client (when use_ssl=True)"""
@@ -65,10 +66,23 @@ class FTPConnection():
         factor=2)
     def __connect(self):
         # Note: MLSD support cache is global and keyed by host:port, so it persists across reconnections
+        # Check if we've already exceeded total connection attempts
+        if self._total_connection_attempts >= (self.retries + 1):
+            self._connection_failed_permanently = True
+            raise Exception(f"FTP/FTPS connection failed permanently after {self._total_connection_attempts} total attempts. "
+                          f"Cannot reconnect to {self.host}:{self.port}.")
+        
         for i in range(self.retries+1):
+            # Check total attempts before each retry
+            if self._total_connection_attempts >= (self.retries + 1):
+                self._connection_failed_permanently = True
+                raise Exception(f"FTP/FTPS connection failed permanently after {self._total_connection_attempts} total attempts. "
+                              f"Cannot reconnect to {self.host}:{self.port}.")
+            
+            self._total_connection_attempts += 1
             try:
                 protocol = "FTPS" if self.use_ssl else "FTP"
-                LOGGER.info(f'Creating new connection to {protocol} at {self.host}:{self.port}...')
+                LOGGER.info(f'Creating new connection to {protocol} at {self.host}:{self.port}... (total attempts: {self._total_connection_attempts})')
                 
                 # Create FTP or FTP_TLS connection based on use_ssl flag
                 if self.use_ssl:
@@ -108,6 +122,7 @@ class FTPConnection():
                 
                 LOGGER.info('Connection successful')
                 self._connection_failed_permanently = False  # Reset flag on successful connection
+                self._total_connection_attempts = 0  # Reset counter on successful connection
                 break
             except (EOFError, ConnectionResetError, TimeoutError) + all_errors as ex:
                 if self.__ftp:
@@ -119,15 +134,15 @@ class FTPConnection():
                     self.__ftp = None
                 error_type = type(ex).__name__
                 error_msg = str(ex)
-                LOGGER.warning(f'Connection failed (attempt {i+1}/{self.retries+1}): {error_type}: {error_msg}')
-                LOGGER.info(f'Connection failed, sleeping for {5*i} seconds...')
-                time.sleep(5*i)
+                LOGGER.warning(f'Connection failed (attempt {i+1}/{self.retries+1}, total attempts: {self._total_connection_attempts}): {error_type}: {error_msg}')
+                LOGGER.info(f'Connection failed, sleeping for 5 seconds...')
+                time.sleep(5)
                 LOGGER.info("Retrying to establish a connection...")
                 if i >= (self.retries):
                     self._connection_failed_permanently = True
                     # Raise specific error for timeout failures
                     if isinstance(ex, TimeoutError):
-                        raise Exception(f"FTP/FTPS connection failed permanently due to timeout after {self.retries+1} attempts. "
+                        raise Exception(f"FTP/FTPS connection failed permanently due to timeout after {self._total_connection_attempts} total attempts. "
                                       f"Unable to connect to {self.host}:{self.port} within {self.connect_timeout}s timeout. "
                                       f"Last error: {error_type}: {error_msg}") from ex
                     raise ex
@@ -143,16 +158,16 @@ class FTPConnection():
                 error_type = type(ex).__name__
                 error_msg = str(ex)
                 import traceback
-                LOGGER.error(f'Unexpected error during connection (attempt {i+1}/{self.retries+1}): {error_type}: {error_msg}')
+                LOGGER.error(f'Unexpected error during connection (attempt {i+1}/{self.retries+1}, total attempts: {self._total_connection_attempts}): {error_type}: {error_msg}')
                 LOGGER.debug(f'Traceback: {traceback.format_exc()}')
-                LOGGER.info(f'Connection failed, sleeping for {5*i} seconds...')
-                time.sleep(5*i)
+                LOGGER.info(f'Connection failed, sleeping for 5 seconds...')
+                time.sleep(5)
                 LOGGER.info("Retrying to establish a connection...")
                 if i >= (self.retries):
                     self._connection_failed_permanently = True
                     # Raise specific error for timeout failures
                     if isinstance(ex, TimeoutError):
-                        raise Exception(f"FTP/FTPS connection failed permanently due to timeout after {self.retries+1} attempts. "
+                        raise Exception(f"FTP/FTPS connection failed permanently due to timeout after {self._total_connection_attempts} total attempts. "
                                       f"Unable to connect to {self.host}:{self.port} within {self.connect_timeout}s timeout. "
                                       f"Last error: {error_type}: {error_msg}") from ex
                     raise ex
