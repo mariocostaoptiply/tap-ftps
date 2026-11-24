@@ -42,6 +42,9 @@ def discover_streams(config):
             # Use cached directory listing and filter by pattern
             cached_files = dir_listing_cache[cache_key]
             matching_files = conn.get_files_matching_pattern(cached_files, table_spec["search_pattern"])
+            if table_spec.get("_dynamic_schema") and not matching_files:
+                LOGGER.info('No file found for configured stream "%s"; skipping.', original_name)
+                continue
             
             # Get schema using the matching files
             schema = json_schema.get_schema_for_table_with_files(conn, table_spec, matching_files, config)

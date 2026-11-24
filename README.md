@@ -38,6 +38,22 @@ Stream names may contain ASCII letters, digits, underscores, and hyphens.
 An absent, null, or empty filename skips that stream; at least one filename is
 required when using flat configuration. Adding an extracted stream does not
 automatically add support for it in the downstream ETL.
+
+In flat mode, populated filenames are authoritative: sync builds its stream list
+from configuration, not the supplied catalog or its selections. Clear a filename
+to disable that stream. Files absent from the FTP folder are excluded from
+discovery and produce no sync output or bookmark changes; they can be picked up
+when uploaded later.
+
+Sync emits each file's schema from its actual headers before emitting records,
+using the same downloaded file. Columns are not restricted by a cached catalog:
+new, renamed, and removed columns follow the current header. Values remain nullable
+strings, preserving leading zeros. Headers must be unique; `_sdc_source_file`,
+`_sdc_source_lineno`, and `_sdc_extra` are reserved metadata columns.
+Legacy `tables` connections still honor their catalog's stream and field selection.
+Hotglue may still need discovery to refresh its saved Data Streams UI; flat sync
+does not depend on that saved catalog.
+
 Flat files use UTF-8 CSV with no configured key properties. The separator is
 detected separately for each file from the first 65,536 decoded characters:
 comma, semicolon, tab, or pipe. Discovery and sync use the same reader.

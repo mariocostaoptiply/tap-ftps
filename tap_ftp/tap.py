@@ -33,6 +33,7 @@ def _configure_tables(config):
             "key_properties": [],
             "delimiter": "auto",
             "encoding": "utf-8",
+            "_dynamic_schema": True,
         }
         replication_key = config.get(f"{stream}_replication_key_column")
         if replication_key not in (None, ""):
@@ -64,6 +65,14 @@ def stream_is_selected(mdata):
 
 def do_sync(config, catalog, state):
     LOGGER.info('Starting sync.')
+    dynamic_tables = [table for table in config["tables"] if table.get("_dynamic_schema")]
+    if dynamic_tables:
+        catalog = singer.Catalog.from_dict({"streams": [{
+            "stream": table["table_name"],
+            "tap_stream_id": table["table_name"],
+            "schema": {},
+            "metadata": [{"breadcrumb": [], "metadata": {"selected": True}}],
+        } for table in dynamic_tables]})
 
     for stream in catalog.streams:
         stream_name = stream.stream
@@ -77,7 +86,8 @@ def do_sync(config, catalog, state):
         key_properties = metadata.get(metadata.to_map(stream.metadata), (), "table-key-properties")
         if key_properties is None: 
             key_properties = []
-        singer.write_schema(stream_name, stream.schema.to_dict(), key_properties)
+        if not dynamic_tables:
+            singer.write_schema(stream_name, stream.schema.to_dict(), key_properties)
 
         LOGGER.info("%s: Starting sync", stream_name)
         try:
@@ -134,7 +144,8 @@ def main():
     
     if args.discover:
         do_discover(args.config)
-    elif args.catalog or args.properties:
+    elif (args.catalog or args.properties or
+          any(table.get("_dynamic_schema") for table in args.config["tables"])):
         do_sync(args.config, args.catalog, args.state)
 
 if __name__=="__main__":

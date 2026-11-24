@@ -208,6 +208,164 @@ def test_auto_separator_failure_preserves_bookmarks(ftp, capsys):
     assert not any(message["type"] == "RECORD" for message in messages(capsys))
 
 
+@pytest.mark.parametrize("catalog_kind", ["missing", "empty", "stale"])
+@pytest.mark.parametrize("new_stream", ["stocks", "warehouse_levels"])
+def test_flat_sync_emits_configured_streams_and_headers_without_catalog_limits(
+        ftp, tmp_path, monkeypatch, capsys, catalog_kind, new_stream):
+    ftp["files"] = {
+        "/imports/inventory[1].csv": b"id;naam\n0001;Item\n",
+        "/imports/levels.csv": "product ref;available qty;Custom/仓库 (A)\n0001;0012;Depot\n".encode("utf-8"),
+    }
+    config = {
+        "host": "synthetic.invalid", "port": 21, "username": "synthetic", "password": "synthetic",
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv", f"{new_stream}_file_name": "levels.csv",
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    argv = ["tap-ftp", "--config", str(config_path)]
+    if catalog_kind != "missing":
+        catalog = {"streams": []}
+        if catalog_kind == "stale":
+            catalog["streams"] = [{
+                "stream": "products", "tap_stream_id": "products",
+                "schema": {"type": "object", "properties": {"obsolete": {"type": "string"}}},
+                "metadata": [{"breadcrumb": [], "metadata": {"selected": False}}],
+            }, {
+                "stream": "unconfigured", "tap_stream_id": "unconfigured", "schema": {},
+                "metadata": [{"breadcrumb": [], "metadata": {"selected": True}}],
+            }]
+        catalog_path = tmp_path / "catalog.json"
+        catalog_path.write_text(json.dumps(catalog))
+        argv += ["--catalog", str(catalog_path)]
+    monkeypatch.setattr("sys.argv", argv)
+    tap.main()
+    output = messages(capsys)
+    schemas = {message["stream"]: message["schema"] for message in output if message["type"] == "SCHEMA"}
+    records = {message["stream"]: message["record"] for message in output if message["type"] == "RECORD"}
+    assert set(schemas) == set(records) == {"products", new_stream}
+    assert {"id", "naam"} <= set(schemas["products"]["properties"])
+    expected = {"product ref": "0001", "available qty": "0012", "Custom/仓库 (A)": "Depot"}
+    assert set(schemas[new_stream]["properties"]) == set(expected) | {
+        "_sdc_source_file", "_sdc_source_lineno", "_sdc_extra",
+    }
+    exported = io.StringIO()
+    writer = csv.DictWriter(exported, fieldnames=list(schemas[new_stream]["properties"]))
+    writer.writeheader()
+    writer.writerow(records[new_stream])
+    restored = next(csv.DictReader(io.StringIO(exported.getvalue())))
+    assert {key: restored[key] for key in expected} == expected
+    assert records["products"]["id"] == "0001"
+    for position, message in enumerate(output):
+        if message["type"] == "RECORD":
+            assert any(previous["type"] == "SCHEMA" and previous["stream"] == message["stream"]
+                       for previous in output[:position])
+    assert sorted(ftp["downloads"]) == ["/imports/inventory[1].csv", "/imports/levels.csv"]
+
+
+def test_flat_sync_refreshes_columns_after_file_headers_change(ftp, capsys):
+    config = {
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv",
+    }
+    tap._configure_tables(config)
+    catalog = selected_catalog(config)
+    state = {}
+    tap.do_sync(config, catalog, state)
+    messages(capsys)
+    ftp["modified"] = "20261122120000"
+    ftp["files"]["/imports/inventory[1].csv"] = b"id;New column!\n0009;00042\n"
+    ftp["downloads"].clear()
+    tap.do_sync(config, catalog, state)
+    output = messages(capsys)
+    schema = next(message["schema"] for message in output if message["type"] == "SCHEMA")
+    assert "New column!" in schema["properties"]
+    assert "name" not in schema["properties"]
+    record = next(message["record"] for message in output if message["type"] == "RECORD")
+    assert record["id"] == "0009"
+    assert record["New column!"] == "00042"
+    assert ftp["downloads"] == ["/imports/inventory[1].csv"]
+
+
+def test_flat_missing_file_is_excluded_until_uploaded_without_losing_state(ftp, capsys):
+    config = {
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv", "stocks_file_name": "levels.csv",
+    }
+    tap._configure_tables(config)
+    catalog = selected_catalog(config)
+    assert [stream.stream for stream in catalog.streams] == ["products"]
+    previous = {"modified_since": "2026-11-19T00:00:00+00:00"}
+    state = {"bookmarks": {"stocks": dict(previous)}}
+    ftp["downloads"].clear()
+    tap.do_sync(config, catalog, state)
+    first = messages(capsys)
+    assert not any(message.get("stream") == "stocks" for message in first)
+    assert state["bookmarks"]["stocks"] == previous
+    assert ftp["downloads"] == ["/imports/inventory[1].csv"]
+    ftp["files"]["/imports/levels.csv"] = b"product_id;quantity\n0001;0012\n"
+    ftp["downloads"].clear()
+    tap.do_sync(config, catalog, state)
+    output = messages(capsys)
+    records = [message for message in output if message["type"] == "RECORD"]
+    assert len(records) == 1
+    assert records[0]["stream"] == "stocks"
+    assert records[0]["record"]["product_id"] == "0001"
+    assert records[0]["record"]["quantity"] == "0012"
+    assert state["bookmarks"]["stocks"]["modified_since"] == "2026-11-21T12:00:00+00:00"
+    assert ftp["downloads"] == ["/imports/levels.csv"]
+
+
+def test_flat_header_only_file_emits_its_actual_schema(ftp, capsys):
+    ftp["files"]["/imports/inventory[1].csv"] = b"code;New field\n"
+    config = {
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv",
+    }
+    tap._configure_tables(config)
+    tap.do_sync(config, singer.Catalog.from_dict({"streams": []}), {})
+    output = messages(capsys)
+    schema = next(message["schema"] for message in output if message["type"] == "SCHEMA")
+    assert {"code", "New field"} <= set(schema["properties"])
+    assert not any(message["type"] == "RECORD" for message in output)
+
+
+@pytest.mark.parametrize("headers", [
+    ["id", "id"], ["id", "_sdc_source_file"], ["id", "_sdc_source_lineno"], ["id", "_sdc_extra"],
+])
+def test_flat_headers_cannot_silently_overwrite_values(ftp, capsys, headers):
+    text = io.StringIO()
+    writer = csv.writer(text)
+    writer.writerow(headers)
+    writer.writerow(["synthetic-one", "synthetic-two"])
+    ftp["files"]["/imports/inventory[1].csv"] = text.getvalue().encode("utf-8")
+    config = {
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv",
+    }
+    tap._configure_tables(config)
+    state = {"bookmarks": {"products": {"modified_since": "2026-11-19T00:00:00+00:00"}}}
+    previous = json.loads(json.dumps(state))
+    with pytest.raises(ValueError, match="unique.*reserved"):
+        tap.do_sync(config, singer.Catalog.from_dict({"streams": []}), state)
+    assert state == previous
+    assert not any(message["type"] in ("SCHEMA", "RECORD") for message in messages(capsys))
+
+
+def test_legacy_catalog_still_controls_stream_selection(ftp, capsys):
+    config = exact_config()
+    catalog = selected_catalog(config)
+    for item in catalog.streams[0].metadata:
+        if not item["breadcrumb"]:
+            item["metadata"]["selected"] = False
+    ftp["downloads"].clear()
+    state = {}
+    tap.do_sync(config, catalog, state)
+    assert not any(message["type"] in ("SCHEMA", "RECORD") for message in messages(capsys))
+    assert ftp["downloads"] == []
+    assert state == {}
+
+
 def test_exact_file_discovery_uses_literal_name_and_shared_folder(ftp):
     config = exact_config(search_prefix="/old", search_pattern=".*")
     catalog = selected_catalog(config)

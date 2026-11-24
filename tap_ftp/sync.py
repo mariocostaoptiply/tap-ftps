@@ -3,7 +3,7 @@ from singer import Transformer, metadata, utils
 from tap_ftp import client, stats
 from tap_ftp.singer_write import write_record
 from tap_ftp.aws_ssm import AWS_SSM
-from tap_ftp.singer_encodings import csv_handler
+from tap_ftp.singer_encodings import csv_handler, json_schema
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -201,6 +201,24 @@ def sync_file(ftp_file_spec, stream, table_spec, config, state, table_name):
             )
 
         for reader in readers:
+            if table_spec.get("_dynamic_schema"):
+                reserved = {
+                    json_schema.SDC_SOURCE_FILE_COLUMN, json_schema.SDC_SOURCE_LINENO_COLUMN,
+                    csv_handler.SDC_EXTRA_COLUMN,
+                }
+                if len(set(reader.fieldnames)) != len(reader.fieldnames) or reserved.intersection(reader.fieldnames):
+                    raise ValueError("CSV headers must be unique and must not use reserved _sdc metadata columns")
+                schema = {
+                    "type": "object",
+                    "properties": {
+                        **json_schema.generate_schema([dict.fromkeys(reader.fieldnames)], table_spec),
+                        json_schema.SDC_SOURCE_FILE_COLUMN: {"type": "string"},
+                        json_schema.SDC_SOURCE_LINENO_COLUMN: {"type": "integer"},
+                        csv_handler.SDC_EXTRA_COLUMN: {"type": "array", "items": {"type": "string"}},
+                    },
+                }
+                stream.schema = singer.Schema.from_dict(schema)
+                singer.write_schema(stream.stream, schema, table_spec.get("key_properties", []))
             # If replication key is active, check if column exists
             if enable_row_level and replication_key_column and not selected_column:
                 if replication_key_column in reader.fieldnames:
