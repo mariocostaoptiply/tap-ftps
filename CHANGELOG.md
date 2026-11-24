@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+  * Auto-detect comma, semicolon, tab, or pipe per flat CSV file in discovery and sync; reject uncertain samples and preserve explicit legacy separators.
   * Detect flat streams dynamically from `<stream>_file_name` fields, with optional matching replication columns and no list-based UI or stream whitelist.
   * Skip unconfigured flat streams and reject mixing flat filenames with legacy tables.
   * Add exact `file_name` selection under a shared `files_path`, without recursive searching.

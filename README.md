@@ -38,7 +38,12 @@ Stream names may contain ASCII letters, digits, underscores, and hyphens.
 An absent, null, or empty filename skips that stream; at least one filename is
 required when using flat configuration. Adding an extracted stream does not
 automatically add support for it in the downstream ETL.
-Flat files use comma-delimited UTF-8 CSV with no configured key properties.
+Flat files use UTF-8 CSV with no configured key properties. The separator is
+detected separately for each file from the first 65,536 decoded characters:
+comma, semicolon, tab, or pipe. Discovery and sync use the same reader.
+Ambiguous, single-column, or undetectable samples fail clearly instead of guessing.
+Legacy tables keep their explicit separator (or the existing comma default);
+set a table's `delimiter` to `"auto"` to opt into detection.
 Do not combine nonempty flat filename fields with a nonempty `tables` list:
 remove the old `tables` configuration when migrating a connection.
 The tap builds the existing table configurations internally, preserving stream

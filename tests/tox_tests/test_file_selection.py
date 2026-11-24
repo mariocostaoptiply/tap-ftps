@@ -1,3 +1,5 @@
+import csv
+import gzip
 import io
 import json
 import socket
@@ -7,7 +9,7 @@ import pytest
 import singer
 
 from tap_ftp import client, discover, stats, tap
-from tap_ftp.singer_encodings import json_schema
+from tap_ftp.singer_encodings import csv_handler, json_schema
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +97,115 @@ def selected_catalog(config):
 
 def messages(capsys):
     return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+
+@pytest.mark.parametrize("delimiter", [",", ";", "\t", "|"])
+@pytest.mark.parametrize("compressed", [False, True])
+def test_auto_separator_preserves_quoted_values_and_all_rows(delimiter, compressed):
+    rows = [
+        ["p-1", 'Widget, semi; tab\tpipe| "quoted"\nsecond line'],
+        ["p-2", "Gadget"],
+    ]
+    text = io.StringIO()
+    writer = csv.writer(text, delimiter=delimiter)
+    writer.writerow(["id", "name"])
+    writer.writerows(rows)
+    data = text.getvalue().encode("utf-8")
+    if compressed:
+        data = gzip.compress(data)
+    readers = csv_handler.get_row_iterators(
+        io.BytesIO(data),
+        options={"delimiter": "auto", "encoding": "utf-8",
+                 "file_name": "products.csv.gz" if compressed else "products.csv"},
+        infer_compression=True,
+    )
+    records = [row for reader in readers for row in reader]
+    assert records == [{"id": key, "name": name} for key, name in rows]
+
+
+@pytest.mark.parametrize("data", [
+    b"id,name;code\np-1,Widget;A\n",
+    b"id\np-1\n",
+    b"id:name\np-1:Widget\n",
+    b"",
+])
+def test_auto_separator_rejects_ambiguous_or_undetectable_files(data):
+    with pytest.raises(ValueError, match="unique CSV separator"):
+        csv_handler.get_row_iterator(io.BytesIO(data), {"delimiter": "auto", "encoding": "utf-8"})
+
+
+@pytest.mark.parametrize("options", [{}, {"delimiter": ","}])
+def test_legacy_separator_is_not_reinterpreted(options):
+    reader = csv_handler.get_row_iterator(
+        io.BytesIO(b"id,name;code\np-1,Widget;A\n"), {"encoding": "utf-8", **options},
+    )
+    assert list(reader) == [{"id": "p-1", "name;code": "Widget;A"}]
+
+
+@pytest.mark.parametrize("delimiter", [",", ";", "\t", "|"])
+def test_flat_auto_separator_discovery_sync_and_replication(ftp, capsys, delimiter):
+    name = "Widget, semi; tab\tpipe| with\nnotes"
+    for filename, separator, header, rows in (
+        ("inventory[1].csv", delimiter, ["id", "name", "updated_at"], [
+            ["p-1", name, "2026-11-20T12:00:00Z"],
+            ["p-2", "Gadget", "2026-11-20T13:00:00Z"],
+        ]),
+        ("vendors.csv", ";", ["id", "name", "Datetime"], [
+            ["s-1", "Vendor, Inc", "2026-11-20T12:00:00Z"],
+        ]),
+    ):
+        text = io.StringIO()
+        writer = csv.writer(text, delimiter=separator)
+        writer.writerow(header)
+        writer.writerows(rows)
+        ftp["files"][f"/imports/{filename}"] = text.getvalue().encode("utf-8")
+    config = {
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv", "products_replication_key_column": "updated_at",
+        "suppliers_file_name": "vendors.csv", "suppliers_replication_key_column": "Datetime",
+    }
+    tap._configure_tables(config)
+    catalog = selected_catalog(config)
+    assert {"id", "name", "updated_at"} <= set(catalog.streams[0].schema.to_dict()["properties"])
+    assert {"id", "name", "Datetime"} <= set(catalog.streams[1].schema.to_dict()["properties"])
+    tap.do_sync(config, catalog, {})
+    first = messages(capsys)
+    records = [message for message in first if message["type"] == "RECORD"]
+    assert {(record["stream"], record["record"]["id"]): record["record"]["name"] for record in records} == {
+        ("products", "p-1"): name, ("products", "p-2"): "Gadget", ("suppliers", "s-1"): "Vendor, Inc",
+    }
+    state = first[-1]["value"]
+    assert state["bookmarks"]["suppliers"]["replication_key_column"] == "Datetime"
+    assert state["bookmarks"]["suppliers"]["replication_key_value"] == "2026-11-20T12:00:00+00:00"
+    checkpoint = json.loads(json.dumps(state))
+    tap.do_sync(config, catalog, state)
+    assert not any(message["type"] == "RECORD" for message in messages(capsys))
+    assert state == checkpoint
+    ftp["modified"] = "20261122120000"
+    ftp["files"]["/imports/vendors.csv"] += b"s-2;New Vendor;2026-11-22T12:00:00Z\n"
+    tap.do_sync(config, catalog, state)
+    changed = messages(capsys)
+    records = [message for message in changed if message["type"] == "RECORD"]
+    assert [(record["stream"], record["record"]["id"]) for record in records] == [("suppliers", "s-2")]
+    assert changed[-1]["value"]["bookmarks"]["suppliers"]["replication_key_value"] == (
+        "2026-11-22T12:00:00+00:00"
+    )
+
+
+def test_auto_separator_failure_preserves_bookmarks(ftp, capsys):
+    config = {
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv",
+    }
+    tap._configure_tables(config)
+    catalog = selected_catalog(config)
+    ftp["files"]["/imports/inventory[1].csv"] = b"id,name;code\np-1,Widget;A\n"
+    state = {"bookmarks": {"products": {"modified_since": "2026-11-19T00:00:00+00:00"}}}
+    previous = json.loads(json.dumps(state))
+    with pytest.raises(ValueError, match="unique CSV separator"):
+        tap.do_sync(config, catalog, state)
+    assert state == previous
+    assert not any(message["type"] == "RECORD" for message in messages(capsys))
 
 
 def test_exact_file_discovery_uses_literal_name_and_shared_folder(ftp):

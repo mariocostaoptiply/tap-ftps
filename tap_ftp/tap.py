@@ -31,7 +31,7 @@ def _configure_tables(config):
             "table_name": stream,
             "file_name": file_name,
             "key_properties": [],
-            "delimiter": ",",
+            "delimiter": "auto",
             "encoding": "utf-8",
         }
         replication_key = config.get(f"{stream}_replication_key_column")

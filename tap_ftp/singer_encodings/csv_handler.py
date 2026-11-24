@@ -30,11 +30,31 @@ def get_row_iterator(iterable, options=None):
     detector.close()
     
     iterable.seek(0)
+    text = io.TextIOWrapper(iterable, encoding=(options.get("encoding") or detector.result.get('encoding')))
+    delimiter = options.get('delimiter', ',')
+    if delimiter == "auto":
+        # shortcut: inspect 64K characters; use an explicit delimiter for longer ambiguous records.
+        sample = text.read(65536)
+        text.seek(0)
+        candidates = []
+        for candidate in ",;\t|":
+            try:
+                csv.Sniffer().sniff(sample, delimiters=candidate)
+                header = next(csv.reader(io.StringIO(sample), delimiter=candidate))
+            except (csv.Error, StopIteration):
+                continue
+            if len(header) > 1:
+                candidates.append(candidate)
+        if len(candidates) != 1:
+            raise ValueError(
+                "Cannot detect a unique CSV separator. Check the file format or set a table delimiter explicitly."
+            )
+        delimiter = candidates[0]
     reader = csv.DictReader(
-        io.TextIOWrapper(iterable, encoding=(options.get("encoding") or detector.result.get('encoding'))),
+        text,
         fieldnames=None,
         restkey=SDC_EXTRA_COLUMN,
-        delimiter=options.get('delimiter', ',')
+        delimiter=delimiter
     )
 
     headers = set(reader.fieldnames)
