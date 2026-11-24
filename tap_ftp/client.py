@@ -351,9 +351,10 @@ class FTPConnection():
                 full_path = f"{prefix_normalized}/{name}"
 
             # Check if it's a directory
-            if self.is_directory(facts) and search_subdirectories:
-                # Recursively get files from subdirectory
-                files += self.get_files_by_prefix(full_path, search_subdirectories)
+            if self.is_directory(facts):
+                if search_subdirectories:
+                    files += self.get_files_by_prefix(full_path, search_subdirectories)
+                continue
             else:
                 # It's a file
                 if self.is_empty(facts):
@@ -590,6 +591,38 @@ class FTPConnection():
             )
         
         return matching
+
+
+def resolve_table_spec(table_spec, config):
+    """Resolve exact filenames or legacy regex selectors without changing the stream identity."""
+    table = dict(table_spec)
+    file_name = table.get("file_name")
+    if file_name not in (None, ""):
+        if (
+            not isinstance(file_name, str) or not file_name.strip()
+            or file_name in (".", "..")
+            or any(char in "/\\" or ord(char) < 32 or ord(char) == 127 for char in file_name)
+        ):
+            raise ValueError("file_name must be a filename without directory separators or control characters")
+        prefix = config.get("files_path")
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError("files_path is required when file_name is provided; use '.' for the FTP login directory")
+        table["search_prefix"] = prefix
+        # Escape and anchor the name so regex metacharacters stay literal.
+        table["search_pattern"] = r"\A" + re.escape(file_name) + r"\Z"
+        table["search_subdirectories"] = False
+    else:
+        pattern = table.get("search_pattern")
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError("Each table requires file_name or search_pattern")
+        prefix = table.get("search_prefix")
+        if prefix in (None, ""):
+            prefix = config.get("files_path", "")
+        table["search_prefix"] = "" if prefix is None else prefix
+        table["search_subdirectories"] = config.get("search_subdirectories", True)
+    if not isinstance(table["search_prefix"], str):
+        raise ValueError("files_path and search_prefix must be directory paths")
+    return table
 
 
 def connection(config):

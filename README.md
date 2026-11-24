@@ -19,6 +19,31 @@ $ pip install .
 
 ## Configuration:
 
+Use `files_path` for one shared FTP directory and `file_name` for each exact file.
+Together with the connection fields and `start_date` shown below, the file-selection config is:
+
+```json
+{
+  "files_path": "/imports",
+  "tables": [
+    {
+      "table_name": "products",
+      "file_name": "inventory.csv",
+      "replication_key_column": "updated_at"
+    }
+  ]
+}
+```
+
+`table_name` is the Singer stream name consumed by the ETL; it does not rename CSV
+columns. Exact filenames are case-sensitive and literal, including characters such
+as `[` and `.`. They must not contain directory separators or control characters.
+Exact-file mode requires a nonempty `files_path` (`"."` means the FTP login directory)
+and never searches subdirectories. It takes precedence over any legacy
+`search_prefix` or `search_pattern` on that table.
+
+Existing regex configurations remain supported unchanged, as in this legacy example:
+
 1. Create a `config.json` file with connection details to your FTP/FTPS server.
 
    ```json
@@ -56,6 +81,7 @@ $ pip install .
    - `password` (required): FTP/FTPS password (FTP/FTPS uses password authentication, not SSH keys)
    - `use_ssl` (optional): Enable FTPS (FTP over SSL/TLS). Default: false (uses plain FTP)
    - `tables` (required): Array of table configurations
+   - `files_path` (required with `file_name`): Shared FTP/FTPS directory; also supplies the default legacy `search_prefix`
    - `start_date` (required): Initial date for file-level bookmarking (ISO format: YYYY-MM-DD)
    - `timeout` (optional): Timeout in seconds for data transfers (default: 300 seconds / 5 minutes)
    - `connect_timeout` (optional): Timeout in seconds for initial connection (default: 30 seconds)
@@ -64,8 +90,9 @@ $ pip install .
    **Table Configuration:**
    
    - `table_name` (required): Name of the stream/table
-   - `search_prefix` (required): Directory path on FTP/FTPS server to search for files
-   - `search_pattern` (required): Regex pattern to match filenames (use `^` and `$` for exact matches)
+   - `file_name` (optional): Exact filename inside `files_path`; takes precedence over legacy search settings
+   - `search_prefix` (optional): Legacy directory override; defaults to `files_path`, then the FTP login directory
+   - `search_pattern` (required without `file_name`): Legacy regex matching filenames; recursive search remains enabled by default
    - `replication_key_column` (optional): Column name for row-level bookmarking (e.g., "updated_at")
    - `delimiter` (optional): CSV delimiter (default: ",")
    - `encoding` (optional): File encoding (default: auto-detected)
@@ -73,6 +100,8 @@ $ pip install .
    **Important Notes:**
    
    - **Regex Patterns**: Use `^pattern$` to ensure exact filename matching (e.g., `^products-.*\\.csv$` matches `products-20241217.csv` but not `supplier_products-20241217.csv`)
+   - **File Selection**: Each table needs `file_name` or a nonempty `search_pattern`; omission never means match all files. Missing or unchanged files emit no records and do not advance that stream's bookmarks.
+   - **State Compatibility**: Bookmarks remain keyed by `table_name`, not the filename. Keep the stream name when migrating existing connections. Changing a file or folder does not reset existing bookmarks.
    - **Row-level Bookmarking**: If `replication_key_column` is specified, the tap will only process rows where the replication key value is greater than the last synced value
    - **File-level Bookmarking**: The tap tracks `last_modified` timestamps and only processes files modified since the last sync
    - **Decryption**: If using the decryption feature, you must pass the configs shown above, including the AWS SSM parameter name for where the decryption private key is stored. In order to retrieve this parameter the runtime environment must have access to SSM through IAM environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN).

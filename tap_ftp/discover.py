@@ -17,10 +17,11 @@ def discover_streams(config):
     # This significantly speeds up discover when multiple tables use the same prefix
     # Key: (prefix, search_subdirectories), Value: list of all files in that prefix
     dir_listing_cache = {}
-    search_subdir = config.get("search_subdirectories", True)
 
     tables = config['tables']
     for table_spec in tables:
+        table_spec = client.resolve_table_spec(table_spec, config)
+        search_subdir = table_spec["search_subdirectories"]
         visible_name = table_spec['table_name'].replace("/", "_")
         original_name = table_spec['table_name']
         if visible_name != original_name:
@@ -40,7 +41,7 @@ def discover_streams(config):
             
             # Use cached directory listing and filter by pattern
             cached_files = dir_listing_cache[cache_key]
-            matching_files = conn.get_files_matching_pattern(cached_files, table_spec['search_pattern'])
+            matching_files = conn.get_files_matching_pattern(cached_files, table_spec["search_pattern"])
             
             # Get schema using the matching files
             schema = json_schema.get_schema_for_table_with_files(conn, table_spec, matching_files, config)

@@ -60,7 +60,6 @@ def sync_stream(config, state, stream):
     
     modified_since = utils.strptime_to_utc(singer.get_bookmark(state, table_visible_name, 'modified_since') or
                                            config['start_date'])
-    search_subdir = config.get("search_subdirectories", True)
 
     LOGGER.info('Syncing table "%s".', table_visible_name)
     LOGGER.info('Getting files modified since %s.', modified_since)
@@ -73,13 +72,13 @@ def sync_stream(config, state, stream):
     if len(table_spec) > 1:
         LOGGER.info("You can only have one file path per table name. Multiple table configurations found for '%s', skipping stream.", table_visible_name)
         return 0
-    table_spec = table_spec[0]
+    table_spec = client.resolve_table_spec(table_spec[0], config)
 
     files = ftp_client.get_files(
         table_spec["search_prefix"],
         table_spec["search_pattern"],
         modified_since,
-        search_subdir
+        table_spec["search_subdirectories"]
     )
     ftp_client.close()
 

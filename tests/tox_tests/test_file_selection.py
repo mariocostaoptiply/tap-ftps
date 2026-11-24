@@ -1,0 +1,272 @@
+import io
+import json
+import socket
+from unittest.mock import Mock
+
+import pytest
+import singer
+
+from tap_ftp import client, discover, stats, tap
+from tap_ftp.singer_encodings import json_schema
+
+
+@pytest.fixture(autouse=True)
+def isolated_job(monkeypatch):
+    def forbid_network(*args, **kwargs):
+        raise AssertionError("File selection tests must not access the network")
+
+    monkeypatch.setattr(socket.socket, "connect", forbid_network)
+    monkeypatch.setattr(socket.socket, "connect_ex", forbid_network)
+    client._mlsd_support_cache.clear()
+    stats.STATS.clear()
+    yield
+    client._mlsd_support_cache.clear()
+    stats.STATS.clear()
+
+
+@pytest.fixture
+def ftp(monkeypatch):
+    source = {
+        "files": {
+            "/imports/inventory[1].csv": (
+                b"id,name,updated_at\np-1,Widget,2026-11-20T12:00:00Z\n"
+                b"p-2,Gadget,2026-11-20T13:00:00Z\n"
+            ),
+            "/imports/inventory1.csv": b"wrong_column\nwrong\n",
+            "/imports/inventory[1].csv.bak": b"wrong_column\nwrong\n",
+            "/imports/archive/inventory[1].csv": b"wrong_column\nwrong\n",
+        },
+        "modified": "20261121120000",
+        "listings": [],
+        "downloads": [],
+    }
+
+    def listing(prefix):
+        source["listings"].append(prefix)
+        entries = {}
+        for path, contents in source["files"].items():
+            if not path.startswith(prefix.rstrip("/") + "/"):
+                continue
+            relative = path[len(prefix.rstrip("/")) + 1:]
+            name, separator, _ = relative.partition("/")
+            entries[name] = {
+                "type": "dir" if separator else "file",
+                "size": str(len(contents)),
+                "modify": source["modified"],
+            }
+        return list(entries.items())
+
+    def connection(config):
+        conn = client.FTPConnection("synthetic.invalid", "synthetic")
+        conn.ftp = Mock(mlsd=Mock(side_effect=listing))
+        return conn
+
+    def file_handle(conn, file_spec, decryption_configs=None):
+        path = file_spec["filepath"]
+        source["downloads"].append(path)
+        return io.BytesIO(source["files"][path])
+
+    monkeypatch.setattr(client, "connection", connection)
+    monkeypatch.setattr(client.FTPConnection, "get_file_handle", file_handle)
+    return source
+
+
+def exact_config(**table_options):
+    return {
+        "files_path": "/imports",
+        "start_date": "2000-01-01T00:00:00Z",
+        "tables": [{
+            "table_name": "products",
+            "file_name": "inventory[1].csv",
+            "replication_key_column": "updated_at",
+            **table_options,
+        }],
+    }
+
+
+def selected_catalog(config):
+    streams = discover.discover_streams(config)
+    for stream in streams:
+        for item in stream["metadata"]:
+            if not item["breadcrumb"]:
+                item["metadata"]["selected"] = True
+    return singer.Catalog.from_dict({"streams": streams})
+
+
+def messages(capsys):
+    return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+
+def test_exact_file_discovery_uses_literal_name_and_shared_folder(ftp):
+    config = exact_config(search_prefix="/old", search_pattern=".*")
+    catalog = selected_catalog(config)
+
+    stream = catalog.streams[0]
+    assert stream.stream == stream.tap_stream_id == "products"
+    assert {"id", "name", "updated_at"} <= set(stream.schema.to_dict()["properties"])
+    assert "wrong_column" not in stream.schema.to_dict()["properties"]
+    assert ftp["downloads"] == ["/imports/inventory[1].csv"]
+    assert ftp["listings"] == ["/imports"]
+    assert config["tables"][0]["search_pattern"] == ".*"
+
+
+def test_discovery_reuses_shared_folder_for_distinct_streams(ftp):
+    ftp["files"]["/imports/vendors.csv"] = b"supplier_id,name\ns-1,Vendor\n"
+    config = exact_config()
+    config["tables"].append({"table_name": "suppliers", "file_name": "vendors.csv"})
+
+    catalog = selected_catalog(config)
+    assert [stream.stream for stream in catalog.streams] == ["products", "suppliers"]
+    assert ftp["listings"] == ["/imports"]
+    assert set(ftp["downloads"]) == {"/imports/inventory[1].csv", "/imports/vendors.csv"}
+
+
+def test_cli_discovery_accepts_filename_without_legacy_fields(ftp, tmp_path, monkeypatch, capsys):
+    config = exact_config()
+    config.update({"host": "synthetic.invalid", "port": 21, "username": "synthetic", "password": "synthetic"})
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr("sys.argv", ["tap-ftp", "--config", str(config_path), "--discover"])
+
+    tap.main()
+    catalog = json.loads(capsys.readouterr().out)
+    assert catalog["streams"][0]["stream"] == "products"
+    assert "id" in catalog["streams"][0]["schema"]["properties"]
+    assert ftp["downloads"] == ["/imports/inventory[1].csv"]
+
+
+def test_exact_sync_emits_named_stream_and_resumes_incrementally(ftp, capsys):
+    config = exact_config()
+    catalog = selected_catalog(config)
+    state = {}
+    ftp["downloads"].clear()
+
+    tap.do_sync(config, catalog, state)
+    first = messages(capsys)
+    records = [message for message in first if message["type"] == "RECORD"]
+    assert [(record["stream"], record["record"]["id"]) for record in records] == [
+        ("products", "p-1"), ("products", "p-2"),
+    ]
+    assert {record["record"]["_sdc_source_file"] for record in records} == {
+        "/imports/inventory[1].csv",
+    }
+    checkpoint = first[-1]["value"]["bookmarks"]["products"]
+    assert checkpoint["modified_since"] == "2026-11-21T12:00:00+00:00"
+    assert checkpoint["replication_key_column"] == "updated_at"
+    assert checkpoint["replication_key_value"] == "2026-11-20T13:00:00+00:00"
+    assert stats.STATS["products"]["files"]["/imports/inventory[1].csv"]["row_count"] == 2
+
+    resumed = json.loads(json.dumps(first[-1]["value"]))
+    ftp["downloads"].clear()
+    tap.do_sync(config, catalog, resumed)
+    assert not any(message["type"] == "RECORD" for message in messages(capsys))
+    assert ftp["downloads"] == []
+    assert resumed["bookmarks"]["products"] == checkpoint
+
+    ftp["modified"] = "20261122120000"
+    ftp["files"]["/imports/inventory[1].csv"] += b"p-3,New,2026-11-22T12:00:00Z\n"
+    tap.do_sync(config, catalog, resumed)
+    updated = messages(capsys)
+    records = [message for message in updated if message["type"] == "RECORD"]
+    assert [record["record"]["id"] for record in records] == ["p-3"]
+    assert updated[-1]["value"]["bookmarks"]["products"]["replication_key_value"] == (
+        "2026-11-22T12:00:00+00:00"
+    )
+
+
+def test_standalone_schema_discovery_accepts_exact_file_config(ftp):
+    config = exact_config()
+    schema = json_schema.get_schema_for_table(client.connection(config), config["tables"][0], config)
+
+    assert "id" in schema["properties"]
+    assert "wrong_column" not in schema["properties"]
+    assert ftp["downloads"] == ["/imports/inventory[1].csv"]
+    assert ftp["listings"] == ["/imports"]
+
+
+@pytest.mark.parametrize("shared_folder", [False, True])
+def test_legacy_regex_discovery_and_sync_still_match_multiple_files(ftp, capsys, shared_folder):
+    ftp["files"] = {
+        "/imports/products-a.csv": b"id,name\np-1,First\n",
+        "/imports/products-b.csv": b"id,name\np-2,Second\n",
+        "/imports/archive/products-c.csv": b"id,name\np-3,Third\n",
+        "/imports/suppliers.csv": b"id,name\ns-1,Supplier\n",
+    }
+    config = {
+        "start_date": "2000-01-01T00:00:00Z",
+        "tables": [{"table_name": "products", "search_pattern": r"^products-.*\.csv$"}],
+    }
+    if shared_folder:
+        config["files_path"] = "/imports"
+    else:
+        config["tables"][0]["search_prefix"] = "/imports"
+    catalog = selected_catalog(config)
+    ftp["downloads"].clear()
+
+    tap.do_sync(config, catalog, {})
+    output = messages(capsys)
+    records = [message for message in output if message["type"] == "RECORD"]
+    assert {record["record"]["id"] for record in records} == {"p-1", "p-2", "p-3"}
+    assert set(ftp["downloads"]) == {
+        "/imports/products-a.csv", "/imports/products-b.csv", "/imports/archive/products-c.csv",
+    }
+
+
+def test_missing_exact_file_does_not_advance_state(ftp, capsys):
+    config = exact_config()
+    catalog = selected_catalog(config)
+    del ftp["files"]["/imports/inventory[1].csv"]
+    state = {"bookmarks": {"products": {"modified_since": "2026-11-19T00:00:00+00:00"}}}
+    previous = json.loads(json.dumps(state))
+    ftp["downloads"].clear()
+
+    tap.do_sync(config, catalog, state)
+    assert not any(message["type"] == "RECORD" for message in messages(capsys))
+    assert state == previous
+    assert ftp["downloads"] == []
+
+
+def test_failed_exact_file_read_does_not_advance_state(ftp, capsys):
+    config = exact_config()
+    catalog = selected_catalog(config)
+    state = {"bookmarks": {"products": {"modified_since": "2026-11-19T00:00:00+00:00"}}}
+    previous = json.loads(json.dumps(state))
+    ftp["files"]["/imports/inventory[1].csv"] = b'id,name\np-1,"unclosed'
+    config["tables"][0]["key_properties"] = ["missing_required_header"]
+
+    with pytest.raises(Exception, match="CSV file missing required headers"):
+        tap.do_sync(config, catalog, state)
+    assert state == previous
+    assert not any(message["type"] == "RECORD" for message in messages(capsys))
+
+
+def test_nonrecursive_listing_does_not_return_directories(ftp):
+    ftp["files"] = {"/imports/inventory[1].csv/child.csv": b"id\np-1\n"}
+    config = exact_config()
+    table = client.resolve_table_spec(config["tables"][0], config)
+    conn = client.connection(config)
+
+    assert conn.get_files(table["search_prefix"], table["search_pattern"], search_subdirectories=False) == []
+    assert ftp["listings"] == ["/imports"]
+
+
+@pytest.mark.parametrize("file_name", ["../inventory.csv", "nested/inventory.csv", "nested\\inventory.csv",
+                                       ".", "..", " ", "inventory.csv\n", "inventory.csv\0", 42])
+def test_invalid_exact_filenames_are_rejected(file_name):
+    config = exact_config(file_name=file_name)
+    with pytest.raises(ValueError, match="file_name"):
+        client.resolve_table_spec(config["tables"][0], config)
+
+
+@pytest.mark.parametrize("folder", [None, "", " ", 42])
+def test_exact_filename_requires_shared_directory(folder):
+    config = exact_config()
+    config["files_path"] = folder
+    with pytest.raises(ValueError, match="files_path"):
+        client.resolve_table_spec(config["tables"][0], config)
+
+
+@pytest.mark.parametrize("options", [{}, {"file_name": ""}, {"search_pattern": ""}, {"search_pattern": None}])
+def test_missing_file_selector_fails_validation(options):
+    with pytest.raises(ValueError, match="file_name or search_pattern"):
+        client.resolve_table_spec({"table_name": "products", **options}, {})

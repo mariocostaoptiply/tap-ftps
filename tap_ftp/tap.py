@@ -5,6 +5,7 @@ import sys
 import singer
 from singer import metadata, utils
 from terminaltables import AsciiTable
+from tap_ftp import client
 
 from tap_ftp.discover import discover_streams
 from tap_ftp.stats import STATS
@@ -12,7 +13,7 @@ from tap_ftp.sync import sync_stream
 
 REQUIRED_CONFIG_KEYS = ["username", "port", "host", "tables", "start_date"]
 REQUIRED_DECRYPT_CONFIG_KEYS = ['SSM_key_name', 'gnupghome', 'passphrase']
-REQUIRED_TABLE_SPEC_CONFIG_KEYS = ["table_name", "search_prefix", "search_pattern"]
+REQUIRED_TABLE_SPEC_CONFIG_KEYS = ["table_name"]
 
 LOGGER = singer.get_logger()
 
@@ -88,6 +89,7 @@ def main():
     # validate tables config
     for table in args.config.get('tables'):
         utils.check_config(table, REQUIRED_TABLE_SPEC_CONFIG_KEYS)
+        client.resolve_table_spec(table, args.config)
 
     decrypt_configs = args.config.get('decryption_configs')
     if decrypt_configs:

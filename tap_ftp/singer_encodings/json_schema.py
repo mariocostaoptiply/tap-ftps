@@ -1,4 +1,5 @@
 import re
+from tap_ftp import client
 from tap_ftp.aws_ssm import AWS_SSM
 from . import csv_handler
 
@@ -7,8 +8,11 @@ SDC_SOURCE_LINENO_COLUMN = "_sdc_source_lineno"
 
 
 def get_schema_for_table(conn, table_spec, config):
-    search_subdir = config.get("search_subdirectories", True)
-    files = conn.get_files(table_spec['search_prefix'], table_spec['search_pattern'], search_subdirectories=search_subdir)
+    table_spec = client.resolve_table_spec(table_spec, config)
+    files = conn.get_files(
+        table_spec["search_prefix"], table_spec["search_pattern"],
+        search_subdirectories=table_spec["search_subdirectories"],
+    )
 
     if not files:
         return {}
