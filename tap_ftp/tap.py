@@ -1,5 +1,6 @@
 import csv
 import json
+import re
 import sys
 
 import singer
@@ -14,20 +15,18 @@ from tap_ftp.sync import sync_stream
 REQUIRED_CONFIG_KEYS = ["username", "port", "host", "start_date"]
 REQUIRED_DECRYPT_CONFIG_KEYS = ['SSM_key_name', 'gnupghome', 'passphrase']
 REQUIRED_TABLE_SPEC_CONFIG_KEYS = ["table_name"]
-OPTIPLY_STREAMS = (
-    "products", "product_compositions", "suppliers", "supplier_products",
-    "sell_orders", "sell_order_lines", "buy_orders", "buy_order_lines", "receipt_lines",
-)
 
 LOGGER = singer.get_logger()
 
 
 def _configure_tables(config):
     tables = []
-    for stream in OPTIPLY_STREAMS:
-        file_name = config.get(f"{stream}_file_name")
-        if file_name in (None, ""):
+    for key, file_name in config.items():
+        if not key.endswith("_file_name") or file_name in (None, ""):
             continue
+        stream = key[:-len("_file_name")]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", stream):
+            raise ValueError(f"Invalid stream name in {key}")
         table = {
             "table_name": stream,
             "file_name": file_name,

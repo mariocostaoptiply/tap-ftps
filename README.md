@@ -30,11 +30,14 @@ For connection UIs without list support, use optional flat fields per Optiply st
 }
 ```
 
-Supported prefixes: `products`, `product_compositions`, `suppliers`,
-`supplier_products`, `sell_orders`, `sell_order_lines`, `buy_orders`,
-`buy_order_lines`, and `receipt_lines`. Each has `<stream>_file_name` and
-`<stream>_replication_key_column`. An absent, null, or empty filename skips that
-stream; at least one filename is required. Replication columns are optional.
+Every top-level `<stream>_file_name` field defines a stream dynamically; the tap
+does not keep a stream whitelist. For example, adding `stocks_file_name` to the
+connector UI and filling it in creates the `stocks` extraction configuration.
+Use `<stream>_replication_key_column` for its optional incremental column.
+Stream names may contain ASCII letters, digits, underscores, and hyphens.
+An absent, null, or empty filename skips that stream; at least one filename is
+required when using flat configuration. Adding an extracted stream does not
+automatically add support for it in the downstream ETL.
 Flat files use comma-delimited UTF-8 CSV with no configured key properties.
 Do not combine nonempty flat filename fields with a nonempty `tables` list:
 remove the old `tables` configuration when migrating a connection.

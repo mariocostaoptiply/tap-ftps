@@ -121,15 +121,21 @@ def test_discovery_reuses_shared_folder_for_distinct_streams(ftp):
     assert set(ftp["downloads"]) == {"/imports/inventory[1].csv", "/imports/vendors.csv"}
 
 
-def test_flat_cli_discovers_and_syncs_all_nine_streams_and_resumes(ftp, tmp_path, monkeypatch, capsys):
-    streams = (
+@pytest.mark.parametrize("streams", [
+    pytest.param((
         "products", "product_compositions", "suppliers", "supplier_products",
         "sell_orders", "sell_order_lines", "buy_orders", "buy_order_lines", "receipt_lines",
-    )
+    ), id="existing"),
+    pytest.param(("stocks", "warehouse_levels", "custom-prices"), id="dynamic"),
+])
+def test_flat_cli_discovers_and_syncs_configured_streams_and_resumes(ftp, tmp_path, monkeypatch, capsys, streams):
     config = {
         "host": "synthetic.invalid", "port": 21, "username": "synthetic", "password": "synthetic",
         "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
     }
+    config["unused_stream_file_name"] = ""
+    config["stocks_file_name_hint"] = "not-a-stream.csv"
+    config["file_name"] = "not-a-stream.csv"
     ftp["files"].clear()
     for stream in streams:
         filename = f"{stream}[1].csv"
@@ -234,6 +240,12 @@ def test_flat_config_rejects_invalid_replication_column(replication_key):
     }
     with pytest.raises(ValueError, match="products_replication_key_column"):
         tap._configure_tables(config)
+
+
+@pytest.mark.parametrize("prefix", ["", "stock/levels", "stock\\levels", "../stocks", "stock levels", "stocks\n"])
+def test_flat_config_rejects_ambiguous_or_unsafe_stream_names(prefix):
+    with pytest.raises(ValueError, match="stream name"):
+        tap._configure_tables({f"{prefix}_file_name": "inventory.csv"})
 
 
 def test_cli_discovery_accepts_filename_without_legacy_fields(ftp, tmp_path, monkeypatch, capsys):
