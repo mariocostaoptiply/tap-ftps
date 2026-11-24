@@ -121,6 +121,121 @@ def test_discovery_reuses_shared_folder_for_distinct_streams(ftp):
     assert set(ftp["downloads"]) == {"/imports/inventory[1].csv", "/imports/vendors.csv"}
 
 
+def test_flat_cli_discovers_and_syncs_all_nine_streams_and_resumes(ftp, tmp_path, monkeypatch, capsys):
+    streams = (
+        "products", "product_compositions", "suppliers", "supplier_products",
+        "sell_orders", "sell_order_lines", "buy_orders", "buy_order_lines", "receipt_lines",
+    )
+    config = {
+        "host": "synthetic.invalid", "port": 21, "username": "synthetic", "password": "synthetic",
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+    }
+    ftp["files"].clear()
+    for stream in streams:
+        filename = f"{stream}[1].csv"
+        config[f"{stream}_file_name"] = filename
+        config[f"{stream}_replication_key_column"] = "updated_at"
+        ftp["files"][f"/imports/{filename}"] = (
+            f"id,name,updated_at\n{stream}-1,Example,2026-11-20T12:00:00Z\n".encode()
+        )
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr("sys.argv", ["tap-ftp", "--config", str(config_path), "--discover"])
+    tap.main()
+    catalog = json.loads(capsys.readouterr().out)
+    assert [stream["stream"] for stream in catalog["streams"]] == list(streams)
+    assert ftp["listings"] == ["/imports"]
+    for stream in catalog["streams"]:
+        assert "id" in stream["schema"]["properties"]
+        for item in stream["metadata"]:
+            if not item["breadcrumb"]:
+                item["metadata"]["selected"] = True
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(json.dumps(catalog))
+    sync_args = ["tap-ftp", "--config", str(config_path), "--catalog", str(catalog_path)]
+    monkeypatch.setattr("sys.argv", sync_args)
+    tap.main()
+    output = messages(capsys)
+    records = [message for message in output if message["type"] == "RECORD"]
+    assert {(record["stream"], record["record"]["id"]) for record in records} == {
+        (stream, f"{stream}-1") for stream in streams
+    }
+    assert {record["record"]["_sdc_source_file"] for record in records} == {
+        f"/imports/{stream}[1].csv" for stream in streams
+    }
+    state = output[-1]["value"]
+    for stream in streams:
+        checkpoint = state["bookmarks"][stream]
+        assert checkpoint["modified_since"] == "2026-11-21T12:00:00+00:00"
+        assert checkpoint["replication_key_column"] == "updated_at"
+        assert checkpoint["replication_key_value"] == "2026-11-20T12:00:00+00:00"
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(state))
+    ftp["downloads"].clear()
+    monkeypatch.setattr("sys.argv", sync_args + ["--state", str(state_path)])
+    tap.main()
+    resumed = messages(capsys)
+    assert not any(message["type"] == "RECORD" for message in resumed)
+    assert next(message["value"] for message in reversed(resumed) if message["type"] == "STATE") == state
+    assert ftp["downloads"] == []
+
+
+@pytest.mark.parametrize("blank", [None, ""])
+def test_flat_cli_skips_blank_filenames_and_allows_no_replication_key(ftp, tmp_path, monkeypatch, capsys, blank):
+    config = {
+        "host": "synthetic.invalid", "port": 21, "username": "synthetic", "password": "synthetic",
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv",
+        "products_replication_key_column": blank,
+        "suppliers_file_name": blank,
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr("sys.argv", ["tap-ftp", "--config", str(config_path), "--discover"])
+    tap.main()
+    catalog = json.loads(capsys.readouterr().out)
+    assert [stream["stream"] for stream in catalog["streams"]] == ["products"]
+    for item in catalog["streams"][0]["metadata"]:
+        if not item["breadcrumb"]:
+            item["metadata"]["selected"] = True
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(json.dumps(catalog))
+    monkeypatch.setattr("sys.argv", [
+        "tap-ftp", "--config", str(config_path), "--catalog", str(catalog_path),
+    ])
+    tap.main()
+    output = messages(capsys)
+    records = [message for message in output if message["type"] == "RECORD"]
+    assert [record["record"]["id"] for record in records] == ["p-1", "p-2"]
+    checkpoint = output[-1]["value"]["bookmarks"]["products"]
+    assert checkpoint["modified_since"] == "2026-11-21T12:00:00+00:00"
+    assert "replication_key_column" not in checkpoint
+
+
+def test_flat_config_rejects_conflicting_legacy_tables():
+    config = exact_config()
+    config["products_file_name"] = "different.csv"
+    with pytest.raises(ValueError, match="not both"):
+        tap._configure_tables(config)
+    assert config["tables"][0]["file_name"] == "inventory[1].csv"
+
+
+@pytest.mark.parametrize("tables", [None, []])
+def test_flat_config_rejects_no_selected_files(tables):
+    with pytest.raises(ValueError, match="at least one"):
+        tap._configure_tables({"tables": tables, "products_file_name": ""})
+
+
+@pytest.mark.parametrize("replication_key", [42, [], " "])
+def test_flat_config_rejects_invalid_replication_column(replication_key):
+    config = {
+        "products_file_name": "inventory.csv",
+        "products_replication_key_column": replication_key,
+    }
+    with pytest.raises(ValueError, match="products_replication_key_column"):
+        tap._configure_tables(config)
+
+
 def test_cli_discovery_accepts_filename_without_legacy_fields(ftp, tmp_path, monkeypatch, capsys):
     config = exact_config()
     config.update({"host": "synthetic.invalid", "port": 21, "username": "synthetic", "password": "synthetic"})

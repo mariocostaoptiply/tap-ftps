@@ -11,11 +11,42 @@ from tap_ftp.discover import discover_streams
 from tap_ftp.stats import STATS
 from tap_ftp.sync import sync_stream
 
-REQUIRED_CONFIG_KEYS = ["username", "port", "host", "tables", "start_date"]
+REQUIRED_CONFIG_KEYS = ["username", "port", "host", "start_date"]
 REQUIRED_DECRYPT_CONFIG_KEYS = ['SSM_key_name', 'gnupghome', 'passphrase']
 REQUIRED_TABLE_SPEC_CONFIG_KEYS = ["table_name"]
+OPTIPLY_STREAMS = (
+    "products", "product_compositions", "suppliers", "supplier_products",
+    "sell_orders", "sell_order_lines", "buy_orders", "buy_order_lines", "receipt_lines",
+)
 
 LOGGER = singer.get_logger()
+
+
+def _configure_tables(config):
+    tables = []
+    for stream in OPTIPLY_STREAMS:
+        file_name = config.get(f"{stream}_file_name")
+        if file_name in (None, ""):
+            continue
+        table = {
+            "table_name": stream,
+            "file_name": file_name,
+            "key_properties": [],
+            "delimiter": ",",
+            "encoding": "utf-8",
+        }
+        replication_key = config.get(f"{stream}_replication_key_column")
+        if replication_key not in (None, ""):
+            if not isinstance(replication_key, str) or not replication_key.strip():
+                raise ValueError(f"{stream}_replication_key_column must be a column name")
+            table["replication_key_column"] = replication_key
+        tables.append(table)
+    if tables:
+        if config.get("tables"):
+            raise ValueError("Use either tables or flat stream file fields, not both")
+        config["tables"] = tables
+    elif not config.get("tables"):
+        raise ValueError("Configure at least one <stream>_file_name or a nonempty tables list")
 
 
 def do_discover(config):
@@ -86,6 +117,7 @@ def do_sync(config, catalog, state):
 @singer.utils.handle_top_exception(LOGGER)
 def main():
     args = utils.parse_args(REQUIRED_CONFIG_KEYS)
+    _configure_tables(args.config)
     # validate tables config
     for table in args.config.get('tables'):
         utils.check_config(table, REQUIRED_TABLE_SPEC_CONFIG_KEYS)

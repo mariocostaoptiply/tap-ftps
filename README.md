@@ -19,6 +19,30 @@ $ pip install .
 
 ## Configuration:
 
+For connection UIs without list support, use optional flat fields per Optiply stream:
+
+```json
+{
+  "files_path": "/imports",
+  "products_file_name": "inventory.csv",
+  "products_replication_key_column": "updated_at",
+  "suppliers_file_name": "vendors.csv"
+}
+```
+
+Supported prefixes: `products`, `product_compositions`, `suppliers`,
+`supplier_products`, `sell_orders`, `sell_order_lines`, `buy_orders`,
+`buy_order_lines`, and `receipt_lines`. Each has `<stream>_file_name` and
+`<stream>_replication_key_column`. An absent, null, or empty filename skips that
+stream; at least one filename is required. Replication columns are optional.
+Flat files use comma-delimited UTF-8 CSV with no configured key properties.
+Do not combine nonempty flat filename fields with a nonempty `tables` list:
+remove the old `tables` configuration when migrating a connection.
+The tap builds the existing table configurations internally, preserving stream
+names, exact-file selection, and bookmarks. These fields supplement the connection
+credentials and `start_date`; they are not a complete connection configuration.
+
+
 Use `files_path` for one shared FTP directory and `file_name` for each exact file.
 Together with the connection fields and `start_date` shown below, the file-selection config is:
 
@@ -80,7 +104,7 @@ Existing regex configurations remain supported unchanged, as in this legacy exam
    - `username` (required): FTP/FTPS username
    - `password` (required): FTP/FTPS password (FTP/FTPS uses password authentication, not SSH keys)
    - `use_ssl` (optional): Enable FTPS (FTP over SSL/TLS). Default: false (uses plain FTP)
-   - `tables` (required): Array of table configurations
+   - `tables` (required without flat filenames): Array of table configurations
    - `files_path` (required with `file_name`): Shared FTP/FTPS directory; also supplies the default legacy `search_prefix`
    - `start_date` (required): Initial date for file-level bookmarking (ISO format: YYYY-MM-DD)
    - `timeout` (optional): Timeout in seconds for data transfers (default: 300 seconds / 5 minutes)
