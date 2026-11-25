@@ -3,6 +3,7 @@ import gzip
 import io
 import json
 import socket
+import zipfile
 from unittest.mock import Mock
 
 import pytest
@@ -666,3 +667,295 @@ def test_exact_filename_requires_shared_directory(folder):
 def test_missing_file_selector_fails_validation(options):
     with pytest.raises(ValueError, match="file_name or search_pattern"):
         client.resolve_table_spec({"table_name": "products", **options}, {})
+
+
+@pytest.fixture
+def file_job(tmp_path, monkeypatch):
+    config = {
+        "host": "synthetic.invalid", "port": 21, "username": "synthetic", "password": "synthetic",
+        "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
+        "products_file_name": "inventory[1].csv",
+    }
+    config_path = tmp_path / "config.json"
+    invocation = 0
+
+    def run(*arguments):
+        nonlocal invocation
+        invocation += 1
+        output = tmp_path / f"sync-output-{invocation}"
+        config["target_dir"] = str(output)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("sys.argv", ["tap-ftp", "--config", str(config_path), *arguments])
+        tap.main()
+        return output
+
+    return config, run
+
+
+def output_rows(directory, stream):
+    with (directory / f"{stream}.csv").open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return reader.fieldnames, list(reader)
+
+
+@pytest.mark.parametrize("delimiter", [",", ";", "\t", "|"])
+@pytest.mark.parametrize("stream", ["stocks", "warehouse_levels"])
+def test_direct_files_preserve_all_columns_without_catalog_filtering(
+        ftp, file_job, tmp_path, capsys, delimiter, stream):
+    config, run = file_job
+    config[f"{stream}_file_name"] = "levels.csv"
+    name = "Widget, semi; tab\tpipe| with\nnotes"
+    text = io.StringIO()
+    writer = csv.writer(text, delimiter=delimiter)
+    writer.writerow(["product ref", "Custom/仓库 (A)", "new column"])
+    writer.writerow(["0001", name, "00042"])
+    ftp["files"]["/imports/levels.csv"] = text.getvalue().encode()
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(json.dumps({"streams": [{
+        "stream": stream, "tap_stream_id": stream,
+        "schema": {"properties": {"obsolete": {"type": "string"}}},
+        "metadata": [{"breadcrumb": [], "metadata": {"selected": False}}],
+    }]}))
+    output = run("--catalog", str(catalog_path))
+    headers, rows = output_rows(output, stream)
+    assert headers == [
+        "product ref", "Custom/仓库 (A)", "new column",
+        "_sdc_source_file", "_sdc_source_lineno", "_sdc_extra",
+    ]
+    assert rows == [{
+        "product ref": "0001", "Custom/仓库 (A)": name, "new column": "00042",
+        "_sdc_source_file": "/imports/levels.csv", "_sdc_source_lineno": "2", "_sdc_extra": "[]",
+    }]
+    assert [row["id"] for row in output_rows(output, "products")[1]] == ["p-1", "p-2"]
+    assert capsys.readouterr().out == ""
+    assert sorted(ftp["downloads"]) == ["/imports/inventory[1].csv", "/imports/levels.csv"]
+
+
+def test_direct_files_resume_adjacent_state_and_keep_file_and_row_bookmarks(
+        ftp, file_job, tmp_path, capsys):
+    config, run = file_job
+    config["products_replication_key_column"] = "updated_at"
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"unrelated": "keep", "bookmarks": {"other": {"cursor": "keep"}}}))
+    first = run()
+    assert [row["id"] for row in output_rows(first, "products")[1]] == ["p-1", "p-2"]
+    checkpoint = json.loads(state_path.read_text())
+    assert checkpoint["unrelated"] == "keep"
+    assert checkpoint["bookmarks"]["other"] == {"cursor": "keep"}
+    assert checkpoint["bookmarks"]["products"] == {
+        "modified_since": "2026-11-21T12:00:00+00:00",
+        "replication_key_column": "updated_at",
+        "replication_key_value": "2026-11-20T13:00:00+00:00",
+    }
+    ftp["downloads"].clear()
+    unchanged = run()
+    assert list(unchanged.glob("*.csv")) == []
+    assert ftp["downloads"] == []
+    assert json.loads(state_path.read_text()) == checkpoint
+    ftp["modified"] = "20261122120000"
+    ftp["files"]["/imports/inventory[1].csv"] = (
+        b"id;name;updated_at;new column\n"
+        b"p-1;Widget;2026-11-20T12:00:00Z;old\n"
+        b"p-2;Gadget;2026-11-20T13:00:00Z;old\n"
+        b"p-3;New;2026-11-22T12:00:00Z;00042\n"
+    )
+    updated = run()
+    headers, rows = output_rows(updated, "products")
+    assert "new column" in headers
+    assert [(row["id"], row["new column"]) for row in rows] == [("p-3", "00042")]
+    assert json.loads(state_path.read_text())["bookmarks"]["products"]["replication_key_value"] == (
+        "2026-11-22T12:00:00+00:00"
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_direct_files_honor_explicit_state_path(ftp, file_job, tmp_path):
+    _, run = file_job
+    adjacent_state = tmp_path / "state.json"
+    adjacent_state.write_text('{"keep": "adjacent"}')
+    explicit_state = tmp_path / "explicit-state.json"
+    explicit_state.write_text(json.dumps({
+        "keep": "explicit", "bookmarks": {"products": {"modified_since": "2026-11-21T12:00:00+00:00"}},
+    }))
+    output = run("--state", str(explicit_state))
+    assert list(output.glob("*.csv")) == []
+    assert ftp["downloads"] == []
+    assert json.loads(adjacent_state.read_text()) == {"keep": "adjacent"}
+    assert json.loads(explicit_state.read_text())["keep"] == "explicit"
+
+
+def test_direct_files_skip_missing_files_without_losing_their_bookmarks(ftp, file_job, tmp_path):
+    config, run = file_job
+    config["stocks_file_name"] = "levels.csv"
+    previous = {"modified_since": "2026-11-19T00:00:00+00:00"}
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"bookmarks": {"stocks": previous}}))
+    output = run()
+    assert not (output / "stocks.csv").exists()
+    assert json.loads(state_path.read_text())["bookmarks"]["stocks"] == previous
+    ftp["files"]["/imports/levels.csv"] = b"product_id;quantity\n0001;0012\n"
+    ftp["downloads"].clear()
+    output = run()
+    assert [row["quantity"] for row in output_rows(output, "stocks")[1]] == ["0012"]
+    assert ftp["downloads"] == ["/imports/levels.csv"]
+
+
+@pytest.mark.parametrize("contents", [
+    b"id,name;code\np-1,Widget;A\n",
+    b"id;id\np-1;p-2\n",
+    b"id;_sdc_extra\np-1;value\n",
+])
+def test_direct_file_failure_does_not_publish_partial_csv_or_advance_state(
+        ftp, file_job, tmp_path, contents):
+    config, run = file_job
+    config["suppliers_file_name"] = "vendors.csv"
+    ftp["files"]["/imports/vendors.csv"] = contents
+    state_path = tmp_path / "state.json"
+    previous = '{"keep": "original bytes", "bookmarks": {}}'
+    state_path.write_text(previous)
+    with pytest.raises(ValueError):
+        run()
+    assert state_path.read_text() == previous
+    assert not list((tmp_path / "sync-output-1").glob("*suppliers*"))
+    ftp["files"]["/imports/vendors.csv"] = b"id;name\ns-1;Vendor\n"
+    output = run()
+    assert [row["id"] for row in output_rows(output, "products")[1]] == ["p-1", "p-2"]
+    assert [row["id"] for row in output_rows(output, "suppliers")[1]] == ["s-1"]
+
+
+@pytest.mark.parametrize("saved", ['{"bookmarks": []}', '[]', '{broken'])
+def test_direct_files_reject_malformed_state_before_source_reads(ftp, file_job, tmp_path, saved):
+    _, run = file_job
+    (tmp_path / "state.json").write_text(saved)
+    with pytest.raises(ValueError):
+        run()
+    assert ftp["listings"] == []
+    assert ftp["downloads"] == []
+    assert (tmp_path / "state.json").read_text() == saved
+
+
+def test_direct_file_state_write_failure_is_retryable(ftp, file_job, tmp_path, monkeypatch):
+    from tap_ftp import file_output
+
+    _, run = file_job
+    state_path = tmp_path / "state.json"
+    previous = '{"bookmarks": {}}'
+    state_path.write_text(previous)
+    replace = file_output.os.replace
+
+    def fail_state(source, destination):
+        if destination == state_path:
+            raise OSError("Synthetic state write failure")
+        replace(source, destination)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(file_output.os, "replace", fail_state)
+        with pytest.raises(OSError, match="state write failure"):
+            run()
+    assert state_path.read_text() == previous
+    assert not list(tmp_path.glob(".*.tmp"))
+    output = run()
+    assert [row["id"] for row in output_rows(output, "products")[1]] == ["p-1", "p-2"]
+
+
+def test_direct_header_only_file_preserves_its_headers(ftp, file_job):
+    ftp["files"]["/imports/inventory[1].csv"] = b"id;new column\n"
+    _, run = file_job
+    headers, rows = output_rows(run(), "products")
+    assert headers[:2] == ["id", "new column"]
+    assert rows == []
+
+
+@pytest.mark.parametrize("extension", ["gz", "zip"])
+def test_direct_files_keep_supported_csv_compression(ftp, file_job, extension):
+    config, run = file_job
+    filename = f"inventory.csv.{extension}"
+    config["products_file_name"] = filename
+    contents = b"id;name\n0001;Item\n"
+    if extension == "gz":
+        packed = gzip.compress(contents)
+    else:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("first.csv", contents)
+            archive.writestr("second.csv", b"id;name\n0002;Other\n")
+        packed = buffer.getvalue()
+    ftp["files"][f"/imports/{filename}"] = packed
+    rows = output_rows(run(), "products")[1]
+    assert [row["id"] for row in rows] == (["0001"] if extension == "gz" else ["0001", "0002"])
+
+
+def test_direct_zip_header_mismatch_does_not_publish_partial_data(ftp, file_job, tmp_path):
+    config, run = file_job
+    config["products_file_name"] = "inventory.zip"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("first.csv", b"id;name\n0001;Item\n")
+        archive.writestr("second.csv", b"id;renamed\n0002;Other\n")
+    ftp["files"]["/imports/inventory.zip"] = buffer.getvalue()
+    with pytest.raises(ValueError, match="same headers"):
+        run()
+    assert not (tmp_path / "sync-output-1" / "products.csv").exists()
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_direct_files_reject_reusing_a_previous_job_output(ftp, file_job, tmp_path):
+    _, run = file_job
+    output = run()
+    previous = (output / "products.csv").read_bytes()
+    checkpoint = (tmp_path / "state.json").read_bytes()
+    ftp["downloads"].clear()
+    with pytest.raises(ValueError, match="fresh job output"):
+        tap.main()
+    assert ftp["downloads"] == []
+    assert (output / "products.csv").read_bytes() == previous
+    assert (tmp_path / "state.json").read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("target_dir", [None, "", " ", 42])
+def test_direct_files_reject_invalid_output_directory(ftp, file_job, tmp_path, monkeypatch, target_dir):
+    config, _ = file_job
+    config["target_dir"] = target_dir
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr("sys.argv", ["tap-ftp", "--config", str(config_path)])
+    with pytest.raises(ValueError, match="target_dir"):
+        tap.main()
+    assert ftp["listings"] == []
+
+
+def test_direct_empty_zip_does_not_publish_or_advance_state(ftp, file_job, tmp_path):
+    config, run = file_job
+    config["products_file_name"] = "empty.zip"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w"):
+        pass
+    ftp["files"]["/imports/empty.zip"] = buffer.getvalue()
+    state_path = tmp_path / "state.json"
+    previous = '{"bookmarks": {"other": {"cursor": "keep"}}}'
+    state_path.write_text(previous)
+    with pytest.raises(ValueError, match="no CSV members"):
+        run()
+    assert state_path.read_text() == previous
+    assert list((tmp_path / "sync-output-1").iterdir()) == []
+
+
+def test_direct_files_reject_remote_deletion_before_reading_source(ftp, file_job):
+    config, run = file_job
+    config["delete_after_sync"] = True
+    with pytest.raises(ValueError, match="cannot delete source files"):
+        run()
+    assert ftp["listings"] == []
+    assert ftp["downloads"] == []
+
+
+def test_direct_files_reject_stale_unconfigured_csvs(ftp, file_job, tmp_path):
+    _, run = file_job
+    output = run()
+    (output / "products.csv").rename(output / "unconfigured.csv")
+    previous = (output / "unconfigured.csv").read_bytes()
+    ftp["downloads"].clear()
+    with pytest.raises(ValueError, match="fresh job output"):
+        tap.main()
+    assert ftp["downloads"] == []
+    assert (output / "unconfigured.csv").read_bytes() == previous

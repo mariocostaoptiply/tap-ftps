@@ -1,6 +1,6 @@
 # tap-ftp
 
-[Singer](https://www.singer.io/) tap that extracts data from FTP and FTPS (FTP over SSL/TLS) files and produces JSON-formatted data following the [Singer spec](https://github.com/singer-io/getting-started/blob/master/docs/SPEC.md).
+FTP and FTPS (FTP over SSL/TLS) extractor. In Hotglue file mode it writes complete CSVs directly into the job's output directory, without a catalog-dependent Singer-to-CSV conversion. Standalone Singer output remains available when no `target_dir` is configured.
 
 ## Install:
 
@@ -45,8 +45,8 @@ to disable that stream. Files absent from the FTP folder are excluded from
 discovery and produce no sync output or bookmark changes; they can be picked up
 when uploaded later.
 
-Sync emits each file's schema from its actual headers before emitting records,
-using the same downloaded file. Columns are not restricted by a cached catalog:
+In standalone Singer mode, sync emits each file's schema from its actual headers
+before emitting records, using the same downloaded file. Columns are not restricted by a cached catalog:
 new, renamed, and removed columns follow the current header. Values remain nullable
 strings, preserving leading zeros. Headers must be unique; `_sdc_source_file`,
 `_sdc_source_lineno`, and `_sdc_extra` are reserved metadata columns.
@@ -65,6 +65,61 @@ remove the old `tables` configuration when migrating a connection.
 The tap builds the existing table configurations internally, preserving stream
 names, exact-file selection, and bookmarks. These fields supplement the connection
 credentials and `start_date`; they are not a complete connection configuration.
+
+### Direct CSV output in Hotglue
+
+Use these source settings alongside the existing connection UI and install URI:
+
+```json
+{
+  "no_fieldmap": true,
+  "connector_props": {
+    "static_data": true
+  }
+}
+```
+
+Hotglue injects `target_dir` into the tap configuration. With flat filename fields
+and a nonempty `target_dir`, the tap writes UTF-8, comma-separated `<stream>.csv`
+files directly there. Every current source column is preserved, including new
+columns absent from a saved catalog. Source separators are still auto-detected;
+values, leading zeros, and quoted newlines are preserved. The three reserved
+`_sdc_*` metadata columns are included, with `_sdc_extra` serialized as JSON.
+No Singer records or state messages are written to stdout in this mode.
+
+The output directory must be fresh for each job: existing CSVs
+cause an error rather than replaying stale data. Missing or unchanged source files
+produce no CSV. Changed header-only files produce a CSV header. Gzip and ZIP CSVs
+remain supported; empty ZIPs are rejected and multiple CSV members in one ZIP must have identical headers.
+Legacy `tables` configurations retain Singer mode; direct output requires flat fields.
+
+Pass `--state` to select a state file explicitly. When Hotglue invokes the tap with
+only `--config`, the tap instead loads and updates `state.json` beside that config.
+An absent state file starts from `start_date`; malformed state fails before any
+FTP access. Existing stream-keyed `modified_since`, `replication_key_column`, and
+`replication_key_value` bookmarks remain compatible, and unrelated state is retained.
+Only files with a newer server modification timestamp are downloaded. If a row
+replication key is configured, only newer rows are written, as in Singer mode.
+Changing content without advancing the server modification timestamp is not detected.
+
+CSV files are published atomically after each successful read, and state is
+replaced atomically only after every configured stream succeeds. A failed sync
+does not advance the saved checkpoint. Hotglue must preserve its own job-level
+state rollback when ETL or export fails; verify that handoff in dev before cutover.
+Direct mode rejects `delete_after_sync`: source files must remain available for
+replay after a later stream, ETL, or export failure.
+
+For a local run, add `"target_dir": "./sync-output"` to the flat config, then run:
+
+```bash
+tap-ftp --config config.json
+```
+
+Use a new output directory for the next run while retaining the same state file.
+Do not enable file-mode source settings against an older Singer-only install.
+After updating the install URI, validate one dev job for CSV headers and values,
+then an unchanged job for file skipping, and a changed-file job for row filtering.
+
 
 
 Use `files_path` for one shared FTP directory and `file_name` for each exact file.

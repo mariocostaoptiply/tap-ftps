@@ -2,6 +2,7 @@ import csv
 import json
 import re
 import sys
+from pathlib import Path
 
 import singer
 from singer import metadata, utils
@@ -9,6 +10,7 @@ from terminaltables import AsciiTable
 from tap_ftp import client
 
 from tap_ftp.discover import discover_streams
+from tap_ftp.file_output import atomic_output
 from tap_ftp.stats import STATS
 from tap_ftp.sync import sync_stream
 
@@ -82,7 +84,8 @@ def do_sync(config, catalog, state):
             LOGGER.info("%s: Skipping - not selected", stream_name)
             continue
 
-        singer.write_state(state)
+        if not config.get("target_dir"):
+            singer.write_state(state)
         key_properties = metadata.get(metadata.to_map(stream.metadata), (), "table-key-properties")
         if key_properties is None: 
             key_properties = []
@@ -146,7 +149,29 @@ def main():
         do_discover(args.config)
     elif (args.catalog or args.properties or
           any(table.get("_dynamic_schema") for table in args.config["tables"])):
+        state_path = None
+        if "target_dir" in args.config:
+            target_dir = args.config["target_dir"]
+            if not isinstance(target_dir, str) or not target_dir.strip():
+                raise ValueError("target_dir must be a nonempty job output directory")
+            if not all(table.get("_dynamic_schema") for table in args.config["tables"]):
+                raise ValueError("Direct file output requires flat <stream>_file_name configuration")
+            if args.config.get("delete_after_sync"):
+                raise ValueError("Direct file output cannot delete source files needed for failed-job replay")
+            output_dir = Path(target_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            # Job output must not replay CSVs left by an earlier local run.
+            if any(output_dir.glob("*.csv")):
+                raise ValueError("target_dir already contains CSVs; use a fresh job output directory")
+            state_path = Path(getattr(args, "state_path", Path(args.config_path).with_name("state.json")))
+            if not hasattr(args, "state_path") and state_path.exists():
+                args.state = utils.load_json(state_path)
+            if not isinstance(args.state, dict) or not isinstance(args.state.get("bookmarks", {}), dict):
+                raise ValueError("State must be a JSON object with an optional bookmarks object")
         do_sync(args.config, args.catalog, args.state)
+        if state_path is not None:
+            with atomic_output(state_path) as handle:
+                json.dump(args.state, handle)
 
 if __name__=="__main__":
     main()

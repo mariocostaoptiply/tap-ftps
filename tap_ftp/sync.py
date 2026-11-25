@@ -1,9 +1,15 @@
+import csv
+import json
+from contextlib import ExitStack
+from pathlib import Path
+
 import singer
 from singer import Transformer, metadata, utils
 from tap_ftp import client, stats
 from tap_ftp.singer_write import write_record
 from tap_ftp.aws_ssm import AWS_SSM
 from tap_ftp.singer_encodings import csv_handler, json_schema
+from tap_ftp.file_output import atomic_output
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -128,7 +134,8 @@ def sync_stream(config, state, stream):
             )
     
     # Write state once after all updates are collected
-    singer.write_state(state)
+    if not config.get("target_dir"):
+        singer.write_state(state)
 
     LOGGER.info('Wrote %s records for table "%s".', records_streamed, table_visible_name)
 
@@ -148,7 +155,14 @@ def sync_file(ftp_file_spec, stream, table_spec, config, state, table_name):
     if decryption_configs:
         decryption_configs['key'] = AWS_SSM.get_decryption_key(decryption_configs.get('SSM_key_name'))
     # Attempt to re-read from the file incase of IO or OS error
-    with ftp_client.get_file_handle(ftp_file_spec, decryption_configs) as file_handle:
+    with ftp_client.get_file_handle(ftp_file_spec, decryption_configs) as file_handle, ExitStack() as output:
+        csv_file = None
+        csv_writer = None
+        output_headers = None
+        if config.get("target_dir"):
+            csv_file = output.enter_context(
+                atomic_output(Path(config["target_dir"]) / f"{stream.stream}.csv")
+            )
         if decryption_configs:
             ftp_file_spec['filepath'] = file_handle.name
 
@@ -208,17 +222,26 @@ def sync_file(ftp_file_spec, stream, table_spec, config, state, table_name):
                 }
                 if len(set(reader.fieldnames)) != len(reader.fieldnames) or reserved.intersection(reader.fieldnames):
                     raise ValueError("CSV headers must be unique and must not use reserved _sdc metadata columns")
-                schema = {
-                    "type": "object",
-                    "properties": {
-                        **json_schema.generate_schema([dict.fromkeys(reader.fieldnames)], table_spec),
-                        json_schema.SDC_SOURCE_FILE_COLUMN: {"type": "string"},
-                        json_schema.SDC_SOURCE_LINENO_COLUMN: {"type": "integer"},
-                        csv_handler.SDC_EXTRA_COLUMN: {"type": "array", "items": {"type": "string"}},
-                    },
-                }
-                stream.schema = singer.Schema.from_dict(schema)
-                singer.write_schema(stream.stream, schema, table_spec.get("key_properties", []))
+                if csv_file is None:
+                    schema = {
+                        "type": "object",
+                        "properties": {
+                            **json_schema.generate_schema([dict.fromkeys(reader.fieldnames)], table_spec),
+                            json_schema.SDC_SOURCE_FILE_COLUMN: {"type": "string"},
+                            json_schema.SDC_SOURCE_LINENO_COLUMN: {"type": "integer"},
+                            csv_handler.SDC_EXTRA_COLUMN: {"type": "array", "items": {"type": "string"}},
+                        },
+                    }
+                    stream.schema = singer.Schema.from_dict(schema)
+                    singer.write_schema(stream.stream, schema, table_spec.get("key_properties", []))
+            if csv_file is not None:
+                headers = [*reader.fieldnames, "_sdc_source_file", "_sdc_source_lineno", csv_handler.SDC_EXTRA_COLUMN]
+                if csv_writer is None:
+                    output_headers = headers
+                    csv_writer = csv.DictWriter(csv_file, fieldnames=headers)
+                    csv_writer.writeheader()
+                elif headers != output_headers:
+                    raise ValueError("CSV members in one stream must have the same headers")
             # If replication key is active, check if column exists
             if enable_row_level and replication_key_column and not selected_column:
                 if replication_key_column in reader.fieldnames:
@@ -292,13 +315,18 @@ def sync_file(ftp_file_spec, stream, table_spec, config, state, table_name):
                     }
                     rec = {**row, **custom_columns}
 
-                    to_write = transformer.transform(rec, stream.schema.to_dict(), metadata.to_map(stream.metadata))
-
-                    write_record(stream.stream, to_write)
+                    if csv_writer is not None:
+                        rec[csv_handler.SDC_EXTRA_COLUMN] = json.dumps(rec[csv_handler.SDC_EXTRA_COLUMN])
+                        csv_writer.writerow(rec)
+                    else:
+                        to_write = transformer.transform(rec, stream.schema.to_dict(), metadata.to_map(stream.metadata))
+                        write_record(stream.stream, to_write)
                     records_synced += 1
                     if records_synced % 100000 == 0:
                         LOGGER.info(f'Synced Record Count: {records_synced}')
             LOGGER.info(f'Sync Complete - Records Synced: {records_synced}')
+        if csv_file is not None and csv_writer is None:
+            raise ValueError("Source archive contains no CSV members")
 
     stats.add_file_data(table_spec, ftp_file_spec['filepath'], ftp_file_spec['last_modified'], records_synced)
 

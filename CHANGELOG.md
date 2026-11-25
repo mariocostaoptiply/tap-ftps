@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+  * Write full stream CSVs directly to Hotglue's `target_dir`, bypassing cached field maps while retaining standalone Singer mode.
+  * Load adjacent `state.json` when the file-mode runner omits `--state`; persist compatible file and row bookmarks atomically after all streams succeed.
+  * Reject stale job output, invalid state, and incompatible archive headers without publishing partial files or advancing saved checkpoints.
   * Build flat sync streams from configured filenames and emit schemas from actual file headers, independent of stale catalogs and without an extra download.
   * Exclude absent flat files from discovery and sync output; retain their bookmarks until the file is available.
   * Preserve arbitrary unique CSV columns and leading zeros; reject collisions with reserved metadata columns.
