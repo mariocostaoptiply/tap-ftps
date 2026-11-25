@@ -32,16 +32,15 @@ def discover_streams(config):
             prefix = table_spec.get('search_prefix', '') or ''
             cache_key = (prefix, search_subdir)
             
-            # If we haven't listed this directory yet, do it once and cache
-            if cache_key not in dir_listing_cache:
-                # Get all files for this prefix (without pattern filtering)
-                # This is the expensive operation we want to cache
-                all_files = conn.get_files_by_prefix(prefix, search_subdir)
-                dir_listing_cache[cache_key] = all_files
-            
-            # Use cached directory listing and filter by pattern
-            cached_files = dir_listing_cache[cache_key]
-            matching_files = conn.get_files_matching_pattern(cached_files, table_spec["search_pattern"])
+            if "_file_spec" in table_spec:
+                matching_files = [table_spec["_file_spec"]]
+            else:
+                # Cache directory listings for legacy selectors.
+                if cache_key not in dir_listing_cache:
+                    all_files = conn.get_files_by_prefix(prefix, search_subdir)
+                    dir_listing_cache[cache_key] = all_files
+                cached_files = dir_listing_cache[cache_key]
+                matching_files = conn.get_files_matching_pattern(cached_files, table_spec["search_pattern"])
             if table_spec.get("_dynamic_schema") and not matching_files:
                 LOGGER.info('No file found for configured stream "%s"; skipping.', original_name)
                 continue

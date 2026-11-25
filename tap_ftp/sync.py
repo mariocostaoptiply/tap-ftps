@@ -64,13 +64,8 @@ def sync_stream(config, state, stream):
     table_visible_name = stream.stream
     table_original_name = stream.tap_stream_id
     
-    modified_since = utils.strptime_to_utc(singer.get_bookmark(state, table_visible_name, 'modified_since') or
-                                           config['start_date'])
 
     LOGGER.info('Syncing table "%s".', table_visible_name)
-    LOGGER.info('Getting files modified since %s.', modified_since)
-
-    ftp_client = client.connection(config)
     table_spec = [table_config for table_config in config["tables"] if table_config["table_name"] == table_original_name]
     if len(table_spec) == 0:
         LOGGER.info("No table configuration found for '%s', skipping stream", table_visible_name)
@@ -80,13 +75,23 @@ def sync_stream(config, state, stream):
         return 0
     table_spec = client.resolve_table_spec(table_spec[0], config)
 
-    files = ftp_client.get_files(
-        table_spec["search_prefix"],
-        table_spec["search_pattern"],
-        modified_since,
-        table_spec["search_subdirectories"]
+    bookmark_key = table_spec.get("_bookmark_key", table_visible_name)
+    modified_since = utils.strptime_to_utc(
+        singer.get_bookmark(state, bookmark_key, 'modified_since') or config['start_date']
     )
-    ftp_client.close()
+    LOGGER.info('Getting files modified since %s.', modified_since)
+    if "_file_spec" in table_spec:
+        file = table_spec["_file_spec"]
+        files = [file] if file["last_modified"] > modified_since else []
+    else:
+        ftp_client = client.connection(config)
+        files = ftp_client.get_files(
+            table_spec["search_prefix"],
+            table_spec["search_pattern"],
+            modified_since,
+            table_spec["search_subdirectories"]
+        )
+        ftp_client.close()
 
     LOGGER.info('Found %s files to be synced.', len(files))
 
@@ -98,7 +103,10 @@ def sync_stream(config, state, stream):
     state_updates = []
     
     with ThreadPoolExecutor(max_workers=8) as executor:
-        future_ftp = {executor.submit(sync_ftp, ftp_file, stream, table_spec, config, state, table_visible_name): ftp_file for ftp_file in files}
+        future_ftp = {
+            executor.submit(sync_ftp, file, stream, table_spec, config, state, bookmark_key): file
+            for file in files
+        }
         for future in as_completed(future_ftp):
             result = future.result()
             records_streamed += result[0]

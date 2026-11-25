@@ -46,16 +46,17 @@ def ftp(monkeypatch):
 
     def listing(prefix):
         source["listings"].append(prefix)
+        prefix = "" if prefix == "." else prefix.rstrip("/") + "/"
         entries = {}
         for path, contents in source["files"].items():
-            if not path.startswith(prefix.rstrip("/") + "/"):
+            if not path.startswith(prefix):
                 continue
-            relative = path[len(prefix.rstrip("/")) + 1:]
+            relative = path[len(prefix):]
             name, separator, _ = relative.partition("/")
             entries[name] = {
                 "type": "dir" if separator else "file",
                 "size": str(len(contents)),
-                "modify": source["modified"],
+                "modify": source.get("modified_by_file", {}).get(path, source["modified"]),
             }
         return list(entries.items())
 
@@ -670,7 +671,8 @@ def test_missing_file_selector_fails_validation(options):
 
 
 @pytest.fixture
-def file_job(tmp_path, monkeypatch):
+def file_job(ftp, tmp_path, monkeypatch):
+    ftp["files"] = {"/imports/inventory[1].csv": ftp["files"]["/imports/inventory[1].csv"]}
     config = {
         "host": "synthetic.invalid", "port": 21, "username": "synthetic", "password": "synthetic",
         "files_path": "/imports", "start_date": "2000-01-01T00:00:00Z",
@@ -742,7 +744,7 @@ def test_direct_files_resume_adjacent_state_and_keep_file_and_row_bookmarks(
     checkpoint = json.loads(state_path.read_text())
     assert checkpoint["unrelated"] == "keep"
     assert checkpoint["bookmarks"]["other"] == {"cursor": "keep"}
-    assert checkpoint["bookmarks"]["products"] == {
+    assert checkpoint["bookmarks"]["/imports/inventory[1].csv"] == {
         "modified_since": "2026-11-21T12:00:00+00:00",
         "replication_key_column": "updated_at",
         "replication_key_value": "2026-11-20T13:00:00+00:00",
@@ -763,7 +765,7 @@ def test_direct_files_resume_adjacent_state_and_keep_file_and_row_bookmarks(
     headers, rows = output_rows(updated, "products")
     assert "new column" in headers
     assert [(row["id"], row["new column"]) for row in rows] == [("p-3", "00042")]
-    assert json.loads(state_path.read_text())["bookmarks"]["products"]["replication_key_value"] == (
+    assert json.loads(state_path.read_text())["bookmarks"]["/imports/inventory[1].csv"]["replication_key_value"] == (
         "2026-11-22T12:00:00+00:00"
     )
     assert capsys.readouterr().out == ""
@@ -782,6 +784,9 @@ def test_direct_files_honor_explicit_state_path(ftp, file_job, tmp_path):
     assert ftp["downloads"] == []
     assert json.loads(adjacent_state.read_text()) == {"keep": "adjacent"}
     assert json.loads(explicit_state.read_text())["keep"] == "explicit"
+    bookmarks = json.loads(explicit_state.read_text())["bookmarks"]
+    assert "products" not in bookmarks
+    assert bookmarks["/imports/inventory[1].csv"]["modified_since"] == "2026-11-21T12:00:00+00:00"
 
 
 def test_direct_files_skip_missing_files_without_losing_their_bookmarks(ftp, file_job, tmp_path):
@@ -959,3 +964,191 @@ def test_direct_files_reject_stale_unconfigured_csvs(ftp, file_job, tmp_path):
         tap.main()
     assert ftp["downloads"] == []
     assert (output / "unconfigured.csv").read_bytes() == previous
+
+
+def test_folder_only_extracts_all_direct_csvs_with_original_names(ftp, file_job):
+    config, run = file_job
+    del config["products_file_name"]
+    ftp["files"].update({
+        "/imports/Client stock.csv": b"sku;qty\n00042;3\n",
+        "/imports/readme.txt": b"not a CSV",
+        "/imports/products.xlsx": b"not a CSV",
+        "/imports/products.csv.bak": b"not a CSV",
+        "/imports/archive/nested.csv": b"sku,qty\nnested,9\n",
+    })
+    output = run()
+    assert {path.name for path in output.glob("*.csv")} == {"inventory[1].csv", "Client stock.csv"}
+    assert output_rows(output, "Client stock")[1][0]["sku"] == "00042"
+    assert ftp["listings"] == ["/imports"]
+    assert sorted(ftp["downloads"]) == ["/imports/Client stock.csv", "/imports/inventory[1].csv"]
+
+
+def test_filename_override_renames_without_filtering_other_files(ftp, file_job, tmp_path):
+    _, run = file_job
+    ftp["files"]["/imports/warehouse stock.csv"] = b"sku,qty\n00042,3\n"
+    output = run()
+    assert {path.name for path in output.glob("*.csv")} == {"products.csv", "warehouse stock.csv"}
+    assert output_rows(output, "products")[1][0]["id"] == "p-1"
+    assert output_rows(output, "warehouse stock")[1][0]["qty"] == "3"
+    assert set(json.loads((tmp_path / "state.json").read_text())["bookmarks"]) == {
+        "/imports/inventory[1].csv", "/imports/warehouse stock.csv",
+    }
+    assert ftp["listings"] == ["/imports"]
+
+
+@pytest.mark.parametrize("extension", [".csv.gz", ".csv.zip", ".zip", ".CSV.GZ", ".ZIP"])
+def test_folder_compressed_files_use_uncompressed_basename(ftp, file_job, extension):
+    config, run = file_job
+    del config["products_file_name"]
+    contents = b"sku;qty\n00042;3\n"
+    if extension.lower().endswith(".gz"):
+        contents = gzip.compress(contents)
+    else:
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("inner.csv", contents)
+        contents = archive.getvalue()
+    ftp["files"]["/imports/Stock quantities" + extension] = contents
+    output = run()
+    assert {path.name for path in output.glob("*.csv")} == {"inventory[1].csv", "Stock quantities.csv"}
+    assert output_rows(output, "Stock quantities")[1][0]["sku"] == "00042"
+    assert ftp["listings"] == ["/imports"]
+
+
+def test_folder_bookmarks_each_source_file_independently(ftp, file_job, tmp_path):
+    config, run = file_job
+    del config["products_file_name"]
+    ftp["files"] = {
+        "/imports/products.csv": b"id,name\np-1,Widget\n",
+        "/imports/suppliers.csv": b"id,name\ns-1,Vendor\n",
+    }
+    ftp["modified_by_file"] = {
+        "/imports/products.csv": "20261123120000",
+        "/imports/suppliers.csv": "20261120120000",
+    }
+    run()
+    ftp["downloads"].clear()
+    ftp["files"]["/imports/suppliers.csv"] = b"id,name\ns-2,New vendor\n"
+    ftp["modified_by_file"]["/imports/suppliers.csv"] = "20261121120000"
+    output = run()
+    assert {path.name for path in output.glob("*.csv")} == {"suppliers.csv"}
+    assert output_rows(output, "suppliers")[1][0]["id"] == "s-2"
+    assert ftp["downloads"] == ["/imports/suppliers.csv"]
+    bookmarks = json.loads((tmp_path / "state.json").read_text())["bookmarks"]
+    assert bookmarks["/imports/products.csv"]["modified_since"] == "2026-11-23T12:00:00+00:00"
+    assert bookmarks["/imports/suppliers.csv"]["modified_since"] == "2026-11-21T12:00:00+00:00"
+
+
+def test_folder_migrates_legacy_state_and_preserves_progress_across_rename(ftp, file_job, tmp_path):
+    config, run = file_job
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "keep": "unrelated",
+        "bookmarks": {
+            "products": {
+                "modified_since": "2026-11-19T12:00:00+00:00",
+                "replication_key_column": "updated_at",
+                "replication_key_value": "2026-11-20T12:00:00+00:00",
+            },
+            "missing": {"cursor": "keep"},
+        },
+    }))
+    first = run()
+    assert [row["id"] for row in output_rows(first, "products")[1]] == ["p-2"]
+    saved = json.loads(state_path.read_text())
+    assert saved["keep"] == "unrelated"
+    assert saved["bookmarks"]["missing"] == {"cursor": "keep"}
+    assert "products" not in saved["bookmarks"]
+    assert saved["bookmarks"]["/imports/inventory[1].csv"]["replication_key_value"] == (
+        "2026-11-20T13:00:00+00:00"
+    )
+    del config["products_file_name"]
+    config["stocks_file_name"] = "inventory[1].csv"
+    ftp["downloads"].clear()
+    assert list(run().glob("*.csv")) == []
+    assert ftp["downloads"] == []
+    assert json.loads(state_path.read_text()) == saved
+    ftp["modified"] = "20261122120000"
+    ftp["files"]["/imports/inventory[1].csv"] += b"p-3,New widget,2026-11-22T12:00:00Z\n"
+    changed = run()
+    assert {path.name for path in changed.glob("*.csv")} == {"stocks.csv"}
+    assert [row["id"] for row in output_rows(changed, "stocks")[1]] == ["p-3"]
+
+
+@pytest.mark.parametrize("collision", ["override", "compression", "case", "duplicate_override"])
+def test_folder_rejects_output_collisions_before_download(ftp, file_job, tmp_path, collision):
+    config, run = file_job
+    if collision == "override":
+        ftp["files"]["/imports/products.csv"] = b"id,name\np-2,Collision\n"
+    elif collision == "compression":
+        del config["products_file_name"]
+        ftp["files"]["/imports/inventory[1].csv.gz"] = gzip.compress(b"id,name\np-2,Collision\n")
+    elif collision == "case":
+        del config["products_file_name"]
+        ftp["files"].update({
+            "/imports/Products.csv": b"id,name\np-2,Collision\n",
+            "/imports/products.csv": b"id,name\np-3,Collision\n",
+        })
+    else:
+        config["stocks_file_name"] = "inventory[1].csv"
+    state_path = tmp_path / "state.json"
+    previous = '{"bookmarks": {"products": {"modified_since": "2026-11-20T12:00:00+00:00"}}}'
+    state_path.write_text(previous)
+    with pytest.raises(ValueError, match="same output|More than one rename"):
+        run()
+    assert ftp["downloads"] == []
+    assert list((tmp_path / "sync-output-1").glob("*.csv")) == []
+    assert state_path.read_text() == previous
+
+
+@pytest.mark.parametrize("unsupported_only", [False, True])
+def test_folder_without_supported_files_keeps_state_and_discovers_empty_catalog(
+    ftp, file_job, tmp_path, capsys, unsupported_only
+):
+    config, run = file_job
+    del config["products_file_name"]
+    ftp["files"] = {"/imports/records.xlsx": b"unsupported"} if unsupported_only else {}
+    state_path = tmp_path / "state.json"
+    previous = {"bookmarks": {"missing": {"cursor": "keep"}}, "keep": "unchanged"}
+    state_path.write_text(json.dumps(previous))
+    run("--discover")
+    assert json.loads(capsys.readouterr().out) == {"streams": []}
+    assert list(run().glob("*.csv")) == []
+    assert json.loads(state_path.read_text()) == previous
+    assert ftp["downloads"] == []
+    assert ftp["listings"] == ["/imports", "/imports"]
+
+
+def test_folder_discovery_uses_one_listing_and_current_source_headers(ftp, file_job, capsys):
+    config, run = file_job
+    del config["products_file_name"]
+    ftp["files"]["/imports/Client stock.csv"] = b"sku,unexpected_column\n00042,value\n"
+    run("--discover")
+    catalog = json.loads(capsys.readouterr().out)
+    streams = {stream["stream"]: stream for stream in catalog["streams"]}
+    assert set(streams) == {"inventory[1]", "Client stock"}
+    assert "unexpected_column" in streams["Client stock"]["schema"]["properties"]
+    assert ftp["listings"] == ["/imports"]
+
+
+@pytest.mark.parametrize("original_missing", [False, True])
+def test_folder_never_migrates_another_source_checkpoint(ftp, file_job, tmp_path, original_missing):
+    config, run = file_job
+    del config["products_file_name"]
+    config["files_path"] = "."
+    ftp["files"] = {"products.csv": b"id,name\np-1,Original\n"}
+    run()
+    state_path = tmp_path / "state.json"
+    original = json.loads(state_path.read_text())["bookmarks"]["products.csv"]
+    if original_missing:
+        del ftp["files"]["products.csv"]
+    ftp["files"]["products.csv.csv"] = b"id,name\np-2,New source\n"
+    ftp["modified_by_file"] = {"products.csv.csv": "20261120120000"}
+    ftp["downloads"].clear()
+    output = run()
+    assert ftp["downloads"] == ["products.csv.csv"]
+    assert {path.name for path in output.glob("*.csv")} == {"products.csv.csv"}
+    assert output_rows(output, "products.csv")[1][0]["id"] == "p-2"
+    bookmarks = json.loads(state_path.read_text())["bookmarks"]
+    assert bookmarks["products.csv"] == original
+    assert bookmarks["products.csv.csv"]["modified_since"] == "2026-11-20T12:00:00+00:00"

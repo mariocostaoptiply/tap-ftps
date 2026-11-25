@@ -7,6 +7,7 @@ def infer(iterable, file_name):
     for supported compression types"""
     if not file_name:
         raise Exception("Need file name")
+    file_name = file_name.lower()
 
     if file_name.endswith('.tar.gz'):
         raise NotImplementedError("tar.gz not supported")

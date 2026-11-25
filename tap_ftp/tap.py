@@ -21,40 +21,103 @@ REQUIRED_TABLE_SPEC_CONFIG_KEYS = ["table_name"]
 LOGGER = singer.get_logger()
 
 
+def _file_table(stream, file_name, config):
+    table = {
+        "table_name": stream, "file_name": file_name, "key_properties": [],
+        "delimiter": "auto", "encoding": "utf-8", "_dynamic_schema": True,
+    }
+    replication_key = config.get(f"{stream}_replication_key_column")
+    if replication_key not in (None, ""):
+        if not isinstance(replication_key, str) or not replication_key.strip():
+            raise ValueError(f"{stream}_replication_key_column must be a column name")
+        table["replication_key_column"] = replication_key
+    return table
+
+
 def _configure_tables(config):
     tables = []
+    folder_mode = "target_dir" in config and not config.get("tables")
     for key, file_name in config.items():
         if not key.endswith("_file_name") or file_name in (None, ""):
             continue
         stream = key[:-len("_file_name")]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", stream):
             raise ValueError(f"Invalid stream name in {key}")
-        table = {
-            "table_name": stream,
-            "file_name": file_name,
-            "key_properties": [],
-            "delimiter": "auto",
-            "encoding": "utf-8",
-            "_dynamic_schema": True,
-        }
-        replication_key = config.get(f"{stream}_replication_key_column")
-        if replication_key not in (None, ""):
-            if not isinstance(replication_key, str) or not replication_key.strip():
-                raise ValueError(f"{stream}_replication_key_column must be a column name")
-            table["replication_key_column"] = replication_key
-        tables.append(table)
+        tables.append(_file_table(stream, file_name, config))
     if tables:
         if config.get("tables"):
             raise ValueError("Use either tables or flat stream file fields, not both")
         config["tables"] = tables
-    elif not config.get("tables"):
+    elif not config.get("tables") and not folder_mode:
         raise ValueError("Configure at least one <stream>_file_name or a nonempty tables list")
+    if folder_mode:
+        folder = config.get("files_path")
+        if not isinstance(folder, str) or not folder.strip():
+            raise ValueError("files_path must be a nonempty FTP folder")
+        config["tables"] = tables
+        config["_folder_mode"] = True
+
+
+def _configure_folder_files(config, state):
+    overrides = {}
+    for table in config["tables"]:
+        name = table["file_name"]
+        if name in overrides:
+            raise ValueError(f"More than one rename is configured for file: {name}")
+        overrides[name] = table
+    conn = client.connection(config)
+    try:
+        files = conn.get_files_by_prefix(config["files_path"], search_subdirectories=False)
+    finally:
+        conn.close()
+    tables = []
+    output_names = set()
+    for file in sorted(files, key=lambda item: item["filepath"]):
+        name = Path(file["filepath"]).name
+        lower = name.lower()
+        if lower.endswith(".csv.gz"):
+            stream = name[:-7]
+        elif lower.endswith(".zip"):
+            stream = name[:-4]
+            if stream.lower().endswith(".csv"):
+                stream = stream[:-4]
+        elif lower.endswith(".csv"):
+            stream = name[:-4]
+        else:
+            continue
+        table = overrides.get(name) or _file_table(stream, name, config)
+        table = client.resolve_table_spec(table, config)
+        output_name = table["table_name"]
+        if not output_name.strip() or output_name in (".", ".."):
+            raise ValueError(f"File has no usable output name: {name}")
+        if output_name.casefold() in output_names:
+            raise ValueError(f"Files would produce the same output CSV: {output_name}")
+        output_names.add(output_name.casefold())
+        table["_file_spec"] = file
+        table["_bookmark_key"] = file["filepath"]
+        tables.append(table)
+    bookmarks = state.get("bookmarks", {})
+    for table in tables:
+        source_key = table["_bookmark_key"]
+        output_name = table["table_name"]
+        old = bookmarks.get(output_name)
+        # Legacy flat names exclude the dots and separators present in source paths.
+        if (
+            source_key not in bookmarks
+            and re.fullmatch(r"[A-Za-z0-9_-]+", output_name)
+            and isinstance(old, dict) and "modified_since" in old
+        ):
+            bookmarks[source_key] = bookmarks.pop(output_name)
+        saved = bookmarks.get(source_key, {})
+        if f"{output_name}_replication_key_column" not in config and saved.get("replication_key_column"):
+            table["replication_key_column"] = saved["replication_key_column"]
+    config["tables"] = tables
 
 
 def do_discover(config):
     LOGGER.info("Starting discover")
     streams = discover_streams(config)
-    if not streams:
+    if not streams and not config.get("_folder_mode"):
         raise Exception("No streams found")
     catalog = {"streams": streams}
     json.dump(catalog, sys.stdout, indent=2)
@@ -68,7 +131,7 @@ def stream_is_selected(mdata):
 def do_sync(config, catalog, state):
     LOGGER.info('Starting sync.')
     dynamic_tables = [table for table in config["tables"] if table.get("_dynamic_schema")]
-    if dynamic_tables:
+    if dynamic_tables or config.get("_folder_mode"):
         catalog = singer.Catalog.from_dict({"streams": [{
             "stream": table["table_name"],
             "tap_stream_id": table["table_name"],
@@ -146,8 +209,11 @@ def main():
         raise Exception("Config is missing a password. FTP/FTPS requires password authentication.")
     
     if args.discover:
+        if args.config.get("_folder_mode"):
+            _configure_folder_files(args.config, {})
         do_discover(args.config)
     elif (args.catalog or args.properties or
+          args.config.get("_folder_mode") or
           any(table.get("_dynamic_schema") for table in args.config["tables"])):
         state_path = None
         if "target_dir" in args.config:
@@ -168,6 +234,8 @@ def main():
                 args.state = utils.load_json(state_path)
             if not isinstance(args.state, dict) or not isinstance(args.state.get("bookmarks", {}), dict):
                 raise ValueError("State must be a JSON object with an optional bookmarks object")
+        if args.config.get("_folder_mode"):
+            _configure_folder_files(args.config, args.state)
         do_sync(args.config, args.catalog, args.state)
         if state_path is not None:
             with atomic_output(state_path) as handle:
